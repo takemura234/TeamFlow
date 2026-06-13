@@ -22,6 +22,10 @@ services:
         sync: false
       - key: TEAMFLOW_ENABLE_SCHEDULER
         value: "1"
+      - key: TEAMFLOW_BACKUP_WEBHOOK_URL
+        sync: false
+      - key: TEAMFLOW_BACKUP_WEBHOOK_TOKEN
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL

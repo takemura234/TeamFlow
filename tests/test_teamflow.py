@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 TEST_DIR = Path(tempfile.mkdtemp(prefix="teamflow-tests-"))
@@ -47,6 +48,8 @@ class TeamFlowApiTest(unittest.TestCase):
             "key: LINE_CHANNEL_ACCESS_TOKEN",
             "key: LINE_CHANNEL_SECRET",
             "key: TEAMFLOW_INITIAL_PASSWORD",
+            "key: TEAMFLOW_BACKUP_WEBHOOK_URL",
+            "key: TEAMFLOW_BACKUP_WEBHOOK_TOKEN",
             "sync: false",
         ):
             self.assertIn(expected, blueprint)
@@ -211,6 +214,91 @@ class TeamFlowApiTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("SQLite", response.get_json()["error"])
+
+    def test_external_backup_uploads_database_to_webhook(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok":true,"retained":1}'
+
+        captured = {}
+
+        def fake_urlopen(http_request, timeout):
+            captured["request"] = http_request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        environment = {
+            "TEAMFLOW_BACKUP_WEBHOOK_URL": "https://example.test/backup",
+            "TEAMFLOW_BACKUP_WEBHOOK_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, environment), patch("server.urllib.request.urlopen", fake_urlopen):
+            result = server.upload_external_backup("test")
+
+        payload = json.loads(captured["request"].data.decode("utf-8"))
+        self.assertEqual(payload["token"], "secret-token")
+        self.assertEqual(payload["reason"], "test")
+        self.assertEqual(payload["keep"], 30)
+        self.assertGreater(len(base64.b64decode(payload["content_base64"])), 0)
+        self.assertEqual(captured["timeout"], 60)
+        self.assertTrue(result["filename"].endswith(".db"))
+
+    def test_data_change_schedules_debounced_external_backup(self):
+        class FakeScheduler:
+            def __init__(self):
+                self.calls = []
+
+            def add_job(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        fake_scheduler = FakeScheduler()
+        environment = {
+            "TEAMFLOW_BACKUP_WEBHOOK_URL": "https://example.test/backup",
+            "TEAMFLOW_BACKUP_WEBHOOK_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, environment), patch.object(server, "scheduler", fake_scheduler):
+            response = self.client.post(
+                "/api/projects",
+                json={
+                    "name": "Backup scheduling project",
+                    "description": "",
+                    "start_date": "2026-06-14",
+                    "end_date": "2026-07-14",
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(fake_scheduler.calls), 1)
+        args, kwargs = fake_scheduler.calls[0]
+        self.assertEqual(args[1], "date")
+        self.assertEqual(kwargs["id"], "external-backup-debounced")
+        self.assertTrue(kwargs["replace_existing"])
+
+    def test_external_backup_failure_notifies_management(self):
+        environment = {
+            "TEAMFLOW_BACKUP_WEBHOOK_URL": "https://example.test/backup",
+            "TEAMFLOW_BACKUP_WEBHOOK_TOKEN": "secret-token",
+        }
+        with patch.dict(os.environ, environment), patch.object(
+            server, "upload_external_backup", side_effect=RuntimeError("test failure")
+        ):
+            server.run_external_backup("failure-test")
+
+        with server.db() as connection:
+            recipients = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT user_id FROM notifications WHERE event_key = ? ORDER BY user_id",
+                    (f"backup-failure:{server.date.today().isoformat()}:failure-test",),
+                )
+            ]
+        self.assertEqual(recipients, [1, 8, 9])
 
     def test_csrf_is_required_for_admin_changes(self):
         response = self.client.post("/api/admin/backup")

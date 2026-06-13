@@ -31,6 +31,9 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TEAMFLOW_DB", BASE_DIR / "teamflow.db"))
 BACKUP_DIR = Path(os.environ.get("TEAMFLOW_BACKUP_DIR", BASE_DIR / "backups"))
+EXTERNAL_BACKUP_DELAY_MINUTES = 5
+EXTERNAL_BACKUP_KEEP = 30
+scheduler = None
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.config.update(
@@ -710,11 +713,116 @@ def restore_database_backup(source_path: Path) -> Path:
     return safety_backup
 
 
+def external_backup_configured() -> bool:
+    return bool(
+        os.environ.get("TEAMFLOW_BACKUP_WEBHOOK_URL")
+        and os.environ.get("TEAMFLOW_BACKUP_WEBHOOK_TOKEN")
+    )
+
+
+def upload_external_backup(reason: str = "scheduled") -> dict:
+    webhook_url = os.environ.get("TEAMFLOW_BACKUP_WEBHOOK_URL", "").strip()
+    webhook_token = os.environ.get("TEAMFLOW_BACKUP_WEBHOOK_TOKEN", "").strip()
+    if not webhook_url or not webhook_token:
+        raise RuntimeError("外部バックアップが未設定です")
+
+    target = create_database_backup()
+    payload = json.dumps(
+        {
+            "token": webhook_token,
+            "filename": target.name,
+            "content_base64": base64.b64encode(target.read_bytes()).decode("ascii"),
+            "reason": reason,
+            "keep": EXTERNAL_BACKUP_KEEP,
+        }
+    ).encode("utf-8")
+    http_request = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(http_request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "Google Driveへの保存に失敗しました")
+        return {"filename": target.name, **result}
+    finally:
+        target.unlink(missing_ok=True)
+
+
+def run_external_backup(reason: str = "scheduled") -> None:
+    if not external_backup_configured():
+        return
+    try:
+        result = upload_external_backup(reason)
+        app.logger.info("External backup completed: %s", result.get("filename"))
+    except Exception as error:
+        app.logger.exception("External backup failed")
+        body = f"TeamFlowの外部バックアップに失敗しました。管理画面で接続テストを確認してください。詳細: {error}"
+        try:
+            with db() as connection:
+                for user_id in management_recipient_ids(connection):
+                    add_notification(
+                        connection,
+                        user_id,
+                        "backup_failure",
+                        body,
+                        f"backup-failure:{date.today().isoformat()}:{reason}",
+                    )
+        except sqlite3.Error:
+            app.logger.exception("Could not record external backup failure")
+
+
+def schedule_external_backup() -> None:
+    if scheduler is None or not external_backup_configured():
+        return
+    scheduler.add_job(
+        run_external_backup,
+        "date",
+        run_date=datetime.now() + timedelta(minutes=EXTERNAL_BACKUP_DELAY_MINUTES),
+        id="external-backup-debounced",
+        kwargs={"reason": "data-change"},
+        replace_existing=True,
+        misfire_grace_time=900,
+    )
+
+
+@app.after_request
+def queue_backup_after_change(response):
+    excluded = {
+        "/api/session", "/api/admin/backup", "/api/admin/restore",
+        "/api/admin/backup/external", "/api/line/webhook",
+    }
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.path.startswith("/api/")
+        and request.path not in excluded
+        and response.status_code < 400
+    ):
+        schedule_external_backup()
+    return response
+
+
 @app.post("/api/admin/backup")
 @require_roles("admin")
 def create_backup():
     target = create_database_backup()
     return jsonify(filename=target.name, size=target.stat().st_size)
+
+
+@app.post("/api/admin/backup/external")
+@require_roles("admin")
+def create_external_backup():
+    if not external_backup_configured():
+        return jsonify(error="外部バックアップの環境変数が未設定です"), 503
+    try:
+        result = upload_external_backup("manual-test")
+    except Exception as error:
+        app.logger.exception("Manual external backup failed")
+        return jsonify(error=f"外部バックアップに失敗しました: {error}"), 502
+    return jsonify(ok=True, filename=result["filename"])
 
 
 @app.get("/api/admin/backup/<path:filename>")
@@ -1637,6 +1745,7 @@ def health():
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
         line_configured=bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")),
         line_webhook_configured=bool(os.environ.get("LINE_CHANNEL_SECRET")),
+        external_backup_configured=external_backup_configured(),
     ), 200 if status == "ok" else 503
 
 
@@ -1646,6 +1755,7 @@ if os.environ.get("TEAMFLOW_ENABLE_SCHEDULER") == "1" and BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
     scheduler.add_job(scheduled_daily_check, "cron", hour=8, minute=5, id="daily-notifications", replace_existing=True)
     scheduler.add_job(scheduled_weekly_report, "cron", day_of_week="mon", hour=8, minute=0, id="weekly-report", replace_existing=True)
+    scheduler.add_job(run_external_backup, "cron", hour=0, minute=0, id="midnight-external-backup", kwargs={"reason": "midnight"}, replace_existing=True, misfire_grace_time=3600)
     scheduler.start()
 
 

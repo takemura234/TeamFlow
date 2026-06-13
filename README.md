@@ -393,6 +393,25 @@ CSVの列は `title, project, assignee, start_date, due_date, priority, status, 
 
 復元後はバックアップに保存されていたログイン情報で再ログインします。復元操作はプロジェクト、タスク、コメント、通知設定など、TeamFlowの全データをバックアップ時点へ戻します。
 
+### Google Driveへの自動バックアップ
+
+無料Render向けに、データ変更の5分後と、サービス稼働中の毎日0時（日本時間）にGoogle DriveへDBを保存できます。連続した変更は最後の変更から5分後の1回にまとめ、Google Driveには直近30件を保持します。
+
+1. Google Driveにバックアップ用フォルダを作成し、URL内のフォルダIDを控える
+2. [Google Apps Script](https://script.google.com/)で新しいプロジェクトを作成する
+3. `google_drive_backup.gs` の内容を貼り付ける
+4. プロジェクトの設定からスクリプトプロパティを追加する
+   - `TEAMFLOW_BACKUP_FOLDER_ID`: Google DriveのフォルダID
+   - `TEAMFLOW_BACKUP_TOKEN`: 十分に長いランダム文字列
+5. 「デプロイ」→「新しいデプロイ」→「ウェブアプリ」を選ぶ
+   - 実行するユーザー: 自分
+   - アクセスできるユーザー: 全員
+6. 発行されたウェブアプリURLをRenderの `TEAMFLOW_BACKUP_WEBHOOK_URL` に設定する
+7. 同じランダム文字列をRenderの `TEAMFLOW_BACKUP_WEBHOOK_TOKEN` に設定する
+8. Renderの再デプロイ後、TeamFlow管理画面の「Google Drive保存テスト」を押す
+
+Apps ScriptのウェブアプリURLは公開されますが、秘密トークンが一致しない送信は拒否されます。トークンはGitHubへ保存しないでください。無料Renderは休止中に0時の処理を実行できないため、変更後5分バックアップを主な保護として使います。
+
 ## Render本番公開
 
 [Renderへデプロイ](https://render.com/deploy?repo=https://github.com/takemura234/TeamFlow)
