@@ -2,7 +2,7 @@ services:
   - type: web
     name: teamflow
     runtime: python
-    plan: free
+    plan: starter
     region: singapore
     branch: main
     autoDeployTrigger: checksPass
@@ -11,9 +11,9 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: TEAMFLOW_DB
-        value: /tmp/teamflow.db
+        value: /var/data/teamflow.db
       - key: TEAMFLOW_BACKUP_DIR
-        value: /tmp/teamflow-backups
+        value: /var/data/backups
       - key: TEAMFLOW_COOKIE_SECURE
         value: "1"
       - key: TEAMFLOW_SECRET_KEY
@@ -28,3 +28,7 @@ services:
         value: gemini-2.5-flash
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
+    disk:
+      name: teamflow-data
+      mountPath: /var/data
+      sizeGB: 1

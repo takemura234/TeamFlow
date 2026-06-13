@@ -383,7 +383,7 @@ CSVの列は `title, project, assignee, start_date, due_date, priority, status, 
 - `GEMINI_API_KEY`: Gemini機能を有効化
 - `LINE_CHANNEL_ACCESS_TOKEN`: LINE Push Messageを有効化
 
-`render.yaml` を使うと、永続ディスク付きのWebサービスとしてデプロイできます。
+`render.yaml` は無料Webサービス用です。SQLiteは一時領域に保存されるため、再起動や再デプロイでデータが初期化される可能性があります。管理画面から定期的にDBバックアップをダウンロードしてください。有料の永続ディスク構成は `render-paid.yaml` に残しています。
 
 ## Render本番公開
 
@@ -395,6 +395,6 @@ RenderのBlueprint作成画面で、次の秘密値を入力します。値はGi
 - `GEMINI_API_KEY`: Google AI Studioで発行したGemini APIキー
 - `LINE_CHANNEL_ACCESS_TOKEN`: LINE DevelopersのMessaging APIチャネルで発行したチャネルアクセストークン
 
-構成はSingaporeリージョン、Starterプラン、1GB永続ディスク、CI成功後の自動デプロイです。公開後は `https://<サービス名>.onrender.com/api/health` を開き、`database`, `gemini_configured`, `line_configured` を確認してください。
+構成はSingaporeリージョン、Freeプラン、CI成功後の自動デプロイです。一定時間アクセスがないと休止し、次のアクセス時に起動まで時間がかかります。公開後は `https://<サービス名>.onrender.com/api/health` を開き、`database`, `gemini_configured`, `line_configured` を確認してください。
 
 Gemini APIキーはGoogle AI StudioのAPI Keys画面で作成します。LINEはMessaging APIチャネルを作成し、チャネルアクセストークンを発行します。LINE通知を受ける各メンバーはボットを友だち追加し、TeamFlowの通知設定で自分のLINE User IDを保存してください。

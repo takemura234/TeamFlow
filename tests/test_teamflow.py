@@ -34,6 +34,7 @@ class TeamFlowApiTest(unittest.TestCase):
     def test_render_blueprint_has_production_integrations(self):
         blueprint = (server.BASE_DIR / "render.yaml").read_text(encoding="utf-8")
         for expected in (
+            "plan: free",
             "healthCheckPath: /api/health",
             "autoDeployTrigger: checksPass",
             "key: GEMINI_API_KEY",
@@ -42,6 +43,7 @@ class TeamFlowApiTest(unittest.TestCase):
             "sync: false",
         ):
             self.assertIn(expected, blueprint)
+        self.assertNotIn("disk:", blueprint)
 
     def test_pwa_service_worker_can_control_the_app(self):
         response = self.client.get("/sw.js", buffered=True)
