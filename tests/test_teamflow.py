@@ -14,6 +14,7 @@ os.environ["TEAMFLOW_DB"] = str(TEST_DIR / "teamflow-test.db")
 os.environ["TEAMFLOW_BACKUP_DIR"] = str(TEST_DIR / "backups")
 os.environ["TEAMFLOW_INITIAL_PASSWORD"] = "TeamFlow2026!"
 os.environ["LINE_CHANNEL_SECRET"] = "test-line-channel-secret"
+os.environ.pop("GEMINI_API_KEY", None)
 os.environ.pop("TEAMFLOW_ENABLE_SCHEDULER", None)
 
 import server  # noqa: E402
@@ -84,6 +85,11 @@ class TeamFlowApiTest(unittest.TestCase):
             headers={"X-Line-Signature": "invalid"},
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_gemini_connection_test_reports_missing_key(self):
+        response = self.client.post("/api/ai/test", headers=self.headers)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("GEMINI_API_KEY", response.get_json()["error"])
 
     def test_pwa_service_worker_can_control_the_app(self):
         response = self.client.get("/sw.js", buffered=True)

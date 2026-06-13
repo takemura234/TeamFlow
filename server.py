@@ -1344,10 +1344,10 @@ def local_advice(prompt: str, tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def gemini_generate(prompt: str) -> str | None:
+def gemini_request(prompt: str) -> tuple[str | None, str | None]:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return None
+        return None, "GEMINI_API_KEYが未設定です"
     model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -1355,9 +1355,31 @@ def gemini_generate(prompt: str) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             result = json.load(response)
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    except (urllib.error.URLError, KeyError, IndexError, TimeoutError):
-        return None
+        return result["candidates"][0]["content"]["parts"][0]["text"], None
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode()).get("error", {}).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            detail = ""
+        app.logger.warning("Gemini HTTP error %s: %s", error.code, detail)
+        return None, f"Gemini APIエラー（HTTP {error.code}）{': ' + detail if detail else ''}"
+    except (urllib.error.URLError, KeyError, IndexError, TimeoutError) as error:
+        app.logger.warning("Gemini request failed: %s", error)
+        return None, "Gemini APIへ接続できませんでした"
+
+
+def gemini_generate(prompt: str) -> str | None:
+    answer, _ = gemini_request(prompt)
+    return answer
+
+
+@app.post("/api/ai/test")
+@require_roles("admin")
+def test_gemini_connection():
+    answer, error = gemini_request("接続確認です。日本語で「Gemini接続成功」とだけ回答してください。")
+    if error:
+        return jsonify(error=error), 503
+    return jsonify(ok=True, model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), answer=answer)
 
 
 def gemini_advice(prompt: str, tasks: list[dict]) -> str | None:
