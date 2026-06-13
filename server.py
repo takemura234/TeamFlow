@@ -432,12 +432,16 @@ LEFT JOIN users u ON u.id = t.assignee_id
 def index():
     if current_user() is None:
         return redirect("/login")
-    return send_from_directory(BASE_DIR / "static", "index.html")
+    response = send_from_directory(BASE_DIR / "static", "index.html")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/login")
 def login_page():
-    return send_from_directory(BASE_DIR / "static", "login.html")
+    response = send_from_directory(BASE_DIR / "static", "login.html")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/sw.js")
