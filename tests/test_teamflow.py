@@ -1,5 +1,9 @@
 import os
 import io
+import base64
+import hashlib
+import hmac
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +13,7 @@ TEST_DIR = Path(tempfile.mkdtemp(prefix="teamflow-tests-"))
 os.environ["TEAMFLOW_DB"] = str(TEST_DIR / "teamflow-test.db")
 os.environ["TEAMFLOW_BACKUP_DIR"] = str(TEST_DIR / "backups")
 os.environ["TEAMFLOW_INITIAL_PASSWORD"] = "TeamFlow2026!"
+os.environ["LINE_CHANNEL_SECRET"] = "test-line-channel-secret"
 os.environ.pop("TEAMFLOW_ENABLE_SCHEDULER", None)
 
 import server  # noqa: E402
@@ -39,11 +44,46 @@ class TeamFlowApiTest(unittest.TestCase):
             "autoDeployTrigger: checksPass",
             "key: GEMINI_API_KEY",
             "key: LINE_CHANNEL_ACCESS_TOKEN",
+            "key: LINE_CHANNEL_SECRET",
             "key: TEAMFLOW_INITIAL_PASSWORD",
             "sync: false",
         ):
             self.assertIn(expected, blueprint)
         self.assertNotIn("disk:", blueprint)
+
+    def test_line_account_can_be_linked_by_signed_webhook_code(self):
+        code_response = self.client.post("/api/account/line/link-code", headers=self.headers)
+        self.assertEqual(code_response.status_code, 200)
+        code = code_response.get_json()["code"]
+        payload = {
+            "events": [{
+                "type": "message",
+                "source": {"type": "user", "userId": "U1234567890"},
+                "message": {"type": "text", "text": code.lower()},
+            }]
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        signature = base64.b64encode(
+            hmac.new(b"test-line-channel-secret", body, hashlib.sha256).digest()
+        ).decode()
+        webhook = server.app.test_client().post(
+            "/api/line/webhook",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Line-Signature": signature},
+        )
+        self.assertEqual(webhook.status_code, 200)
+        self.assertEqual(webhook.get_json()["linked"], 1)
+        with server.db() as connection:
+            account = connection.execute("SELECT line_user_id FROM users WHERE id = 1").fetchone()
+        self.assertEqual(account["line_user_id"], "U1234567890")
+
+    def test_line_webhook_rejects_invalid_signature(self):
+        response = server.app.test_client().post(
+            "/api/line/webhook",
+            json={"events": []},
+            headers={"X-Line-Signature": "invalid"},
+        )
+        self.assertEqual(response.status_code, 401)
 
     def test_pwa_service_worker_can_control_the_app(self):
         response = self.client.get("/sw.js", buffered=True)

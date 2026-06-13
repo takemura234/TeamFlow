@@ -5,5 +5,6 @@
 .admin-tool-buttons a{text-decoration:none;color:var(--ink);display:inline-flex;align-items:center}
 .admin-user{gap:12px}
 .admin-user .row-action{margin-left:auto;white-space:nowrap}
+.line-link-panel{display:grid;gap:14px;margin-top:18px}.line-link-panel p{line-height:1.8}.line-link-code{display:block;padding:18px;text-align:center;background:#f2f5ef;border:2px dashed var(--green);font:700 24px/1 monospace;letter-spacing:.08em;color:var(--green);user-select:all}
 
 @media (max-width:700px){.admin-tools{align-items:flex-start;flex-direction:column}.admin-tool-buttons{display:grid;width:100%}.admin-tool-buttons>*{justify-content:center}.admin-user{align-items:flex-start;flex-wrap:wrap}.admin-user .row-action{margin-left:0}}

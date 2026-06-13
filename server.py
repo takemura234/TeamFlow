@@ -6,6 +6,9 @@ import secrets
 import sqlite3
 import csv
 import io
+import base64
+import hashlib
+import hmac
 import urllib.error
 import urllib.request
 from functools import wraps
@@ -196,6 +199,12 @@ def init_db() -> None:
         in_app_enabled INTEGER NOT NULL DEFAULT 1,
         line_enabled INTEGER NOT NULL DEFAULT 0,
         weekly_summary_enabled INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS line_link_codes (
+        user_id INTEGER PRIMARY KEY,
+        code TEXT NOT NULL UNIQUE,
+        expires_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     """
@@ -421,7 +430,7 @@ def validate_task_data(connection: sqlite3.Connection, data: dict, partial: bool
 
 @app.before_request
 def protect_api():
-    if not request.path.startswith("/api/") or request.path in {"/api/session", "/api/health"}:
+    if not request.path.startswith("/api/") or request.path in {"/api/session", "/api/health", "/api/line/webhook"}:
         return None
     if current_user() is None:
         return jsonify(error="ログインが必要です"), 401
@@ -524,6 +533,59 @@ def update_line_account():
     with db() as connection:
         connection.execute("UPDATE users SET line_user_id = ? WHERE id = ?", (line_user_id or None, user["id"]))
     return jsonify(line_user_id=line_user_id)
+
+
+@app.post("/api/account/line/link-code")
+def create_line_link_code():
+    user = current_user()
+    code = f"TF-{secrets.token_hex(3).upper()}"
+    expires_at = (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")
+    with db() as connection:
+        connection.execute(
+            """INSERT INTO line_link_codes(user_id, code, expires_at) VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET code = excluded.code, expires_at = excluded.expires_at""",
+            (user["id"], code, expires_at),
+        )
+    return jsonify(code=code, expires_at=expires_at)
+
+
+def valid_line_signature(body: bytes, signature: str) -> bool:
+    secret = os.environ.get("LINE_CHANNEL_SECRET", "")
+    if not secret or not signature:
+        return False
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode()
+    return secrets.compare_digest(expected, signature)
+
+
+@app.post("/api/line/webhook")
+def line_webhook():
+    body = request.get_data()
+    if not valid_line_signature(body, request.headers.get("X-Line-Signature", "")):
+        return jsonify(error="Invalid signature"), 401
+    payload = request.get_json(silent=True) or {}
+    linked = 0
+    with db() as connection:
+        for event in payload.get("events", []):
+            if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
+                continue
+            code = str(event["message"].get("text", "")).strip().upper()
+            line_user_id = event.get("source", {}).get("userId", "")
+            if not line_user_id or not code.startswith("TF-"):
+                continue
+            link = connection.execute(
+                "SELECT user_id FROM line_link_codes WHERE code = ? AND datetime(expires_at) >= datetime('now')",
+                (code,),
+            ).fetchone()
+            if link is None:
+                send_line_message(line_user_id, "連携コードが無効または期限切れです。TeamFlowで新しいコードを発行してください。")
+                continue
+            connection.execute("UPDATE users SET line_user_id = NULL WHERE line_user_id = ?", (line_user_id,))
+            connection.execute("UPDATE users SET line_user_id = ? WHERE id = ?", (line_user_id, link["user_id"]))
+            connection.execute("DELETE FROM line_link_codes WHERE user_id = ?", (link["user_id"],))
+            send_line_message(line_user_id, "TeamFlowとのLINE連携が完了しました。")
+            linked += 1
+    return jsonify(ok=True, linked=linked)
 
 
 @app.post("/api/notify/line/test")
@@ -1436,6 +1498,7 @@ def health():
         gemini_configured=bool(os.environ.get("GEMINI_API_KEY")),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
         line_configured=bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")),
+        line_webhook_configured=bool(os.environ.get("LINE_CHANNEL_SECRET")),
     ), 200 if status == "ok" else 503
 
 

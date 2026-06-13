@@ -394,7 +394,10 @@ RenderのBlueprint作成画面で、次の秘密値を入力します。値はGi
 - `TEAMFLOW_INITIAL_PASSWORD`: 初回ログイン用パスワード（英字・数字を含む10文字以上を推奨）
 - `GEMINI_API_KEY`: Google AI Studioで発行したGemini APIキー
 - `LINE_CHANNEL_ACCESS_TOKEN`: LINE DevelopersのMessaging APIチャネルで発行したチャネルアクセストークン
+- `LINE_CHANNEL_SECRET`: LINE DevelopersのBasic settingsに表示されるChannel secret
 
 構成はSingaporeリージョン、Freeプラン、CI成功後の自動デプロイです。一定時間アクセスがないと休止し、次のアクセス時に起動まで時間がかかります。公開後は `https://<サービス名>.onrender.com/api/health` を開き、`database`, `gemini_configured`, `line_configured` を確認してください。
 
 Gemini APIキーはGoogle AI StudioのAPI Keys画面で作成します。LINEはMessaging APIチャネルを作成し、チャネルアクセストークンを発行します。LINE通知を受ける各メンバーはボットを友だち追加し、TeamFlowの通知設定で自分のLINE User IDを保存してください。
+
+LINE DevelopersのMessaging API設定では、Webhook URLを `https://<サービス名>.onrender.com/api/line/webhook` に設定して`Use webhook`を有効にします。各メンバーはTeamFlowの通知設定で連携コードを発行し、そのコードをLINE公式アカウントのトークへ送ると自動連携されます。
