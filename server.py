@@ -891,14 +891,22 @@ def update_project(project_id: int):
 @app.delete("/api/projects/<int:project_id>")
 @require_roles("admin")
 def delete_project(project_id: int):
+    cascade = request.args.get("cascade") == "1"
     with db() as connection:
         project = connection.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
         if project is None:
             return jsonify(error="プロジェクトが見つかりません"), 404
         task_count = connection.execute("SELECT COUNT(*) FROM tasks WHERE project_id = ?", (project_id,)).fetchone()[0]
         milestone_count = connection.execute("SELECT COUNT(*) FROM milestones WHERE project_id = ?", (project_id,)).fetchone()[0]
-        if task_count or milestone_count:
+        if (task_count or milestone_count) and not cascade:
             return jsonify(error="タスクまたはマイルストーンがあるプロジェクトは削除できません"), 409
+        if cascade:
+            task_ids = [row["id"] for row in connection.execute("SELECT id FROM tasks WHERE project_id = ?", (project_id,))]
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                connection.execute(f"DELETE FROM notifications WHERE task_id IN ({placeholders})", task_ids)
+            connection.execute("DELETE FROM tasks WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM milestones WHERE project_id = ?", (project_id,))
         connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return "", 204
 

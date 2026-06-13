@@ -111,6 +111,29 @@ class TeamFlowApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["name"], "Production project")
 
+    def test_project_with_children_requires_explicit_cascade_delete(self):
+        project = self.client.post(
+            "/api/projects",
+            json={"name": "Delete project", "start_date": "2026-06-13", "end_date": "2026-09-13"},
+            headers=self.headers,
+        ).get_json()
+        task = self.client.post(
+            "/api/tasks",
+            json={
+                "title": "Delete with project", "project_id": project["id"],
+                "start_date": "2026-06-13", "due_date": "2026-06-20",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(task.status_code, 201)
+        blocked = self.client.delete(f"/api/projects/{project['id']}", headers=self.headers)
+        self.assertEqual(blocked.status_code, 409)
+        deleted = self.client.delete(f"/api/projects/{project['id']}?cascade=1", headers=self.headers)
+        self.assertEqual(deleted.status_code, 204)
+        with server.db() as connection:
+            self.assertIsNone(connection.execute("SELECT id FROM projects WHERE id = ?", (project["id"],)).fetchone())
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks WHERE project_id = ?", (project["id"],)).fetchone()[0], 0)
+
     def test_tasks_can_be_imported_from_csv(self):
         with server.db() as connection:
             project = connection.execute("SELECT name FROM projects ORDER BY id LIMIT 1").fetchone()["name"]
