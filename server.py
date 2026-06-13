@@ -13,6 +13,11 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ImportError:
+    BackgroundScheduler = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TEAMFLOW_DB", BASE_DIR / "teamflow.db"))
@@ -43,6 +48,8 @@ def migrate_users(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE users ADD COLUMN username TEXT")
     if "password_hash" not in columns:
         connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    if "line_user_id" not in columns:
+        connection.execute("ALTER TABLE users ADD COLUMN line_user_id TEXT")
 
     initial_password = os.environ.get("TEAMFLOW_INITIAL_PASSWORD", "TeamFlow2026!")
     users = connection.execute("SELECT id, role, username, password_hash FROM users ORDER BY id").fetchall()
@@ -209,7 +216,36 @@ def add_notification(
            VALUES (?, ?, ?, ?, ?)""",
         (user_id, task_id, notification_type, body, event_key),
     )
+    if cursor.rowcount > 0:
+        line = connection.execute(
+            """SELECT u.line_user_id, s.line_enabled
+               FROM users u JOIN user_notification_settings s ON s.user_id = u.id
+               WHERE u.id = ?""",
+            (user_id,),
+        ).fetchone()
+        if line and line["line_enabled"] and line["line_user_id"]:
+            send_line_message(line["line_user_id"], body)
     return cursor.rowcount > 0
+
+
+def send_line_message(line_user_id: str, message: str) -> bool:
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    if not token:
+        return False
+    payload = json.dumps({
+        "to": line_user_id,
+        "messages": [{"type": "text", "text": message[:5000]}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/push",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, TimeoutError):
+        return False
 
 
 def run_notification_checks(connection: sqlite3.Connection) -> int:
@@ -431,6 +467,51 @@ def user_session():
     )
 
 
+@app.put("/api/account/password")
+def change_password():
+    data = request.get_json(force=True)
+    current_password = data.get("current_password", "")
+    new_password = data.get("new_password", "")
+    if len(new_password) < 10 or not any(c.isalpha() for c in new_password) or not any(c.isdigit() for c in new_password):
+        return jsonify(error="新しいパスワードは英字と数字を含む10文字以上にしてください"), 400
+    user = current_user()
+    with db() as connection:
+        account = connection.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
+        if not check_password_hash(account["password_hash"], current_password):
+            return jsonify(error="現在のパスワードが違います"), 400
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (generate_password_hash(new_password), user["id"]),
+        )
+    return jsonify(ok=True)
+
+
+@app.put("/api/account/line")
+def update_line_account():
+    data = request.get_json(force=True)
+    line_user_id = str(data.get("line_user_id", "")).strip()
+    if line_user_id and (len(line_user_id) > 64 or not line_user_id.startswith("U")):
+        return jsonify(error="LINE User IDが正しくありません"), 400
+    user = current_user()
+    with db() as connection:
+        connection.execute("UPDATE users SET line_user_id = ? WHERE id = ?", (line_user_id or None, user["id"]))
+    return jsonify(line_user_id=line_user_id)
+
+
+@app.post("/api/notify/line/test")
+def test_line_notification():
+    user = current_user()
+    with db() as connection:
+        account = connection.execute("SELECT line_user_id FROM users WHERE id = ?", (user["id"],)).fetchone()
+    if not account["line_user_id"]:
+        return jsonify(error="LINE User IDを設定してください"), 400
+    if not os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"):
+        return jsonify(error="LINE_CHANNEL_ACCESS_TOKENが未設定です"), 503
+    if not send_line_message(account["line_user_id"], "TeamFlowからのテスト通知です。"):
+        return jsonify(error="LINE通知の送信に失敗しました"), 502
+    return jsonify(ok=True)
+
+
 @app.get("/api/bootstrap")
 def bootstrap():
     user = current_user()
@@ -460,6 +541,9 @@ def bootstrap():
         notification_settings = dict(connection.execute(
             "SELECT * FROM user_notification_settings WHERE user_id = ?", (user["id"],)
         ).fetchone())
+        account = dict(connection.execute(
+            "SELECT line_user_id FROM users WHERE id = ?", (user["id"],)
+        ).fetchone())
     return jsonify(
         tasks=tasks,
         projects=projects,
@@ -467,6 +551,7 @@ def bootstrap():
         notifications=notifications,
         milestones=milestones,
         notification_settings=notification_settings,
+        account=account,
         current_user=dict(user),
         csrf_token=session["csrf_token"],
     )
@@ -1005,12 +1090,11 @@ def local_advice(prompt: str, tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def gemini_advice(prompt: str, tasks: list[dict]) -> str | None:
+def gemini_generate(prompt: str) -> str | None:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
-    context = json.dumps(tasks, ensure_ascii=False)
-    payload = json.dumps({"contents": [{"parts": [{"text": f"あなたは日本語のプロジェクト管理アドバイザーです。簡潔に回答してください。\nタスク: {context}\n質問: {prompt}"}]}]}).encode()
+    payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
@@ -1019,6 +1103,27 @@ def gemini_advice(prompt: str, tasks: list[dict]) -> str | None:
         return result["candidates"][0]["content"]["parts"][0]["text"]
     except (urllib.error.URLError, KeyError, IndexError, TimeoutError):
         return None
+
+
+def gemini_advice(prompt: str, tasks: list[dict]) -> str | None:
+    context = json.dumps(tasks, ensure_ascii=False)
+    return gemini_generate(
+        f"あなたは日本語のプロジェクト管理アドバイザーです。簡潔に回答してください。\nタスク: {context}\n質問: {prompt}"
+    )
+
+
+def build_weekly_report(tasks: list[dict]) -> str:
+    completed = [task for task in tasks if task["status"] == "done"]
+    active = [task for task in tasks if task["status"] != "done"]
+    overdue = [task for task in active if task["days_left"] < 0]
+    important = sorted(active, key=lambda task: (task["priority"] != "high", task["days_left"]))[:5]
+    lines = ["【TeamFlow 週次レポート】", f"完了タスク: {len(completed)}件", f"進行中タスク: {len(active)}件", f"期限超過: {len(overdue)}件"]
+    if important:
+        lines.append("今週の重要タスク:")
+        lines.extend(f"・{task['title']}（{task['assignee_name'] or '未割当'} / {task['progress']}%）" for task in important)
+    if overdue:
+        lines.append("最優先で期限超過タスクの再計画を行ってください。")
+    return "\n".join(lines)
 
 
 @app.post("/api/ai-advice")
@@ -1030,9 +1135,94 @@ def ai_advice():
         return jsonify(error="相談内容を入力してください"), 400
     with db() as connection:
         tasks = rows_to_dicts(connection.execute(TASK_SELECT + " ORDER BY t.due_date").fetchall())
-        answer = gemini_advice(prompt, tasks) or local_advice(prompt, tasks)
+        gemini_answer = gemini_advice(prompt, tasks)
+        answer = gemini_answer or local_advice(prompt, tasks)
         connection.execute("INSERT INTO ai_logs(prompt, response) VALUES (?, ?)", (prompt, answer))
-    return jsonify(answer=answer, provider="gemini" if os.environ.get("GEMINI_API_KEY") else "local")
+    return jsonify(answer=answer, provider="gemini" if gemini_answer else "local")
+
+
+@app.post("/api/ai-replan/<int:task_id>")
+@require_roles("admin")
+def ai_replan(task_id: int):
+    with db() as connection:
+        task = connection.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task is None:
+            return jsonify(error="タスクが見つかりません"), 404
+        workloads = connection.execute(
+            """SELECT u.id, u.name, COUNT(t.id) AS active_count
+               FROM users u LEFT JOIN tasks t ON t.assignee_id = u.id AND t.status != 'done'
+               WHERE u.role = 'member' GROUP BY u.id, u.name ORDER BY active_count, u.id"""
+        ).fetchall()
+        assignee = workloads[0] if workloads else None
+        delay = max(3, abs(task["days_left"]) + 2 if task["days_left"] < 0 else 3)
+        suggested_due = max(
+            date.fromisoformat(task["start_date"]), date.today() + timedelta(days=delay)
+        ).isoformat()
+        context = f"タスク「{task['title']}」は進捗{task['progress']}%、期限{task['due_date']}です。担当候補は{assignee['name'] if assignee else '現担当'}、新期限候補は{suggested_due}です。理由を80文字以内で説明してください。"
+        reason = gemini_generate(context) or "期限と現在の進捗、メンバーの担当件数をもとに、負荷の少ない担当者と現実的な期限を提案しました。"
+    return jsonify(
+        task_id=task_id,
+        assignee_id=assignee["id"] if assignee else task["assignee_id"],
+        assignee_name=assignee["name"] if assignee else task["assignee_name"],
+        due_date=suggested_due,
+        reason=reason,
+    )
+
+
+@app.post("/api/ai-replan/<int:task_id>/apply")
+@require_roles("admin")
+def apply_ai_replan(task_id: int):
+    data = request.get_json(force=True)
+    with db() as connection:
+        task = connection.execute("SELECT start_date FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None:
+            return jsonify(error="タスクが見つかりません"), 404
+        try:
+            assignee_id = int(data["assignee_id"])
+            due_date = date.fromisoformat(data["due_date"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify(error="提案内容が正しくありません"), 400
+        if due_date.isoformat() < task["start_date"]:
+            return jsonify(error="期限は開始日以降にしてください"), 400
+        if connection.execute("SELECT 1 FROM users WHERE id = ? AND role = 'member'", (assignee_id,)).fetchone() is None:
+            return jsonify(error="担当者が見つかりません"), 404
+        connection.execute(
+            "UPDATE tasks SET assignee_id = ?, due_date = ?, updated_at = ? WHERE id = ?",
+            (assignee_id, due_date.isoformat(), datetime.now().isoformat(timespec="seconds"), task_id),
+        )
+        connection.execute(
+            "INSERT INTO comments(task_id, author, body) VALUES (?, ?, ?)",
+            (task_id, current_user()["name"], f"AI再計画を承認：担当者と期限を{due_date.isoformat()}へ更新しました。"),
+        )
+        updated = dict(connection.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone())
+    return jsonify(updated)
+
+
+@app.post("/api/ai-weekly-report")
+@require_roles("admin")
+def ai_weekly_report():
+    with db() as connection:
+        tasks = rows_to_dicts(connection.execute(TASK_SELECT + " ORDER BY t.due_date").fetchall())
+        base = build_weekly_report(tasks)
+        gemini_report = gemini_generate(f"次の週次レポートに短い改善コメントを追加してください。\n{base}")
+        report = gemini_report or base
+        connection.execute("INSERT INTO ai_logs(prompt, response) VALUES (?, ?)", ("weekly-report", report))
+        add_notification(connection, current_user()["id"], "weekly", report, f"weekly:{date.today().isoformat()}")
+    return jsonify(report=report, provider="gemini" if gemini_report else "local")
+
+
+def scheduled_daily_check() -> None:
+    with db() as connection:
+        run_notification_checks(connection)
+
+
+def scheduled_weekly_report() -> None:
+    with db() as connection:
+        tasks = rows_to_dicts(connection.execute(TASK_SELECT + " ORDER BY t.due_date").fetchall())
+        base = build_weekly_report(tasks)
+        report = gemini_generate(f"次の週次レポートに短い改善コメントを追加してください。\n{base}") or base
+        connection.execute("INSERT INTO ai_logs(prompt, response) VALUES (?, ?)", ("weekly-report", report))
+        add_notification(connection, 1, "weekly", report, f"weekly:{date.today().isoformat()}")
 
 
 @app.get("/api/health")
@@ -1041,6 +1231,12 @@ def health():
 
 
 init_db()
+
+if os.environ.get("TEAMFLOW_ENABLE_SCHEDULER") == "1" and BackgroundScheduler:
+    scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
+    scheduler.add_job(scheduled_daily_check, "cron", hour=8, minute=5, id="daily-notifications", replace_existing=True)
+    scheduler.add_job(scheduled_weekly_report, "cron", day_of_week="mon", hour=8, minute=0, id="weekly-report", replace_existing=True)
+    scheduler.start()
 
 
 if __name__ == "__main__":

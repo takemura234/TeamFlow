@@ -6,4 +6,4 @@ teamflow.db
 outputs/
 work/
 .pytest_cache/
-
+backups/

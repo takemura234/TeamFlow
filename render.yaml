@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: teamflow
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --workers 1 --threads 4 --timeout 60
+    envVars:
+      - key: TEAMFLOW_DB
+        value: /var/data/teamflow.db
+      - key: TEAMFLOW_COOKIE_SECURE
+        value: "1"
+      - key: TEAMFLOW_SECRET_KEY
+        generateValue: true
+      - key: TEAMFLOW_ENABLE_SCHEDULER
+        value: "1"
+    disk:
+      name: teamflow-data
+      mountPath: /var/data
+      sizeGB: 1

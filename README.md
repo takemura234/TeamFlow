@@ -354,3 +354,24 @@
 - 右端をドラッグ: 期限を変更
 - 今日の日付をオレンジ色の縦線で表示
 - 変更内容はタスクコメントへ自動記録
+
+## 追加された運用機能
+
+- 音声入力: 新規タスク画面を開くと「音声で入力」ボタンを表示
+- パスワード変更: 通知設定画面から本人が変更
+- LINE連携: LINE User IDを保存し、テスト通知を送信
+- AI再計画: 遅延リスク欄から担当者・期限案を生成し、承認後に反映
+- 週次レポート: AI画面から手動生成、または毎週月曜8時に自動生成
+- 日次通知チェック: 毎日8時5分に自動実行
+- SQLiteバックアップ: `python backup_db.py` で `backups/` に保存
+
+### 本番環境変数
+
+- `TEAMFLOW_SECRET_KEY`: セッション署名用の十分に長いランダム値
+- `TEAMFLOW_DB`: DBファイルパス。Renderでは `/var/data/teamflow.db`
+- `TEAMFLOW_COOKIE_SECURE=1`: HTTPS限定Cookie
+- `TEAMFLOW_ENABLE_SCHEDULER=1`: 日次通知・週次レポートを有効化
+- `GEMINI_API_KEY`: Gemini機能を有効化
+- `LINE_CHANNEL_ACCESS_TOKEN`: LINE Push Messageを有効化
+
+`render.yaml` を使うと、永続ディスク付きのWebサービスとしてデプロイできます。
