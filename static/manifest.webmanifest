@@ -1,0 +1,19 @@
+{
+  "name": "TeamFlow",
+  "short_name": "TeamFlow",
+  "description": "チームのタスク・進捗・期限を共有するプロジェクト管理アプリ",
+  "lang": "ja",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f6f1",
+  "theme_color": "#153d32",
+  "icons": [
+    {
+      "src": "/static/teamflow-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

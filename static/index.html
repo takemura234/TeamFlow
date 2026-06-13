@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153d32">
   <title>TeamFlow</title>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" href="/static/teamflow-icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/teamflow-icon.svg">
   <link rel="stylesheet" href="/static/style.css">
   <style>
     .task-link{border:0;background:none;padding:0;color:var(--ink);font:inherit;font-weight:700;text-align:left;cursor:pointer}.task-link:hover{color:var(--green);text-decoration:underline}
@@ -73,5 +77,6 @@
   <button id="voiceTaskButton" class="voice-task-button" type="button" hidden>音声で入力</button>
   <div id="toast" class="toast"></div>
   <script src="/static/app.js"></script>
+  <script src="/static/pwa.js"></script>
 </body>
 </html>

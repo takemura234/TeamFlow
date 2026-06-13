@@ -4,13 +4,15 @@ import json
 import os
 import secrets
 import sqlite3
+import csv
+import io
 import urllib.error
 import urllib.request
 from functools import wraps
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, request, send_file, send_from_directory, session
+from flask import Flask, Response, jsonify, redirect, request, send_file, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
@@ -438,6 +440,14 @@ def login_page():
     return send_from_directory(BASE_DIR / "static", "login.html")
 
 
+@app.get("/sw.js")
+def service_worker():
+    response = send_from_directory(BASE_DIR / "static", "sw.js")
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 @app.route("/api/session", methods=["GET", "POST", "DELETE"])
 def user_session():
     if request.method == "GET":
@@ -553,6 +563,120 @@ def download_backup(filename: str):
     if not target.exists() or target.suffix != ".db":
         return jsonify(error="バックアップが見つかりません"), 404
     return send_file(target, as_attachment=True, download_name=safe_name)
+
+
+CSV_FIELDS = ["title", "project", "assignee", "start_date", "due_date", "priority", "status", "progress", "description"]
+CSV_ALIASES = {
+    "title": ("title", "タスク名"), "project": ("project", "プロジェクト"),
+    "assignee": ("assignee", "担当者"), "start_date": ("start_date", "開始日"),
+    "due_date": ("due_date", "期限"), "priority": ("priority", "優先度"),
+    "status": ("status", "ステータス", "状態"), "progress": ("progress", "進捗"),
+    "description": ("description", "説明"),
+}
+PRIORITY_IMPORT = {"高": "high", "中": "medium", "低": "low", "high": "high", "medium": "medium", "low": "low"}
+STATUS_IMPORT = {
+    "未着手": "todo", "進行中": "in_progress", "レビュー待ち": "review", "完了": "done", "保留": "hold",
+    "todo": "todo", "in_progress": "in_progress", "review": "review", "done": "done", "hold": "hold",
+}
+
+
+def csv_safe(value) -> str:
+    text = str(value or "")
+    return f"'{text}" if text.startswith(("=", "+", "-", "@")) else text
+
+
+@app.get("/api/admin/tasks/export")
+@require_roles("admin")
+def export_tasks_csv():
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    with db() as connection:
+        tasks = connection.execute(TASK_SELECT + " ORDER BY t.due_date, t.id").fetchall()
+    for task in tasks:
+        writer.writerow({
+            "title": csv_safe(task["title"]), "project": csv_safe(task["project_name"]),
+            "assignee": csv_safe(task["assignee_name"]), "start_date": task["start_date"],
+            "due_date": task["due_date"], "priority": task["priority"], "status": task["status"],
+            "progress": task["progress"], "description": csv_safe(task["description"]),
+        })
+    filename = f"teamflow-tasks-{date.today().isoformat()}.csv"
+    return Response(
+        "\ufeff" + output.getvalue(),
+        content_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/admin/tasks/import")
+@require_roles("admin")
+def import_tasks_csv():
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename.lower().endswith(".csv"):
+        return jsonify(error="CSVファイルを選択してください"), 400
+    raw = uploaded.read(2_000_001)
+    if len(raw) > 2_000_000:
+        return jsonify(error="CSVファイルは2MB以下にしてください"), 413
+    try:
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    except UnicodeDecodeError:
+        return jsonify(error="CSVはUTF-8形式で保存してください"), 400
+    if not reader.fieldnames:
+        return jsonify(error="CSVのヘッダーがありません"), 400
+    headers = {name.strip(): name for name in reader.fieldnames if name}
+    columns = {field: next((headers[name] for name in aliases if name in headers), None) for field, aliases in CSV_ALIASES.items()}
+    if not all(columns[field] for field in ("title", "project", "start_date", "due_date")):
+        return jsonify(error="必須列は title, project, start_date, due_date です"), 400
+
+    prepared = []
+    errors = []
+    with db() as connection:
+        projects = {row["name"]: row["id"] for row in connection.execute("SELECT id, name FROM projects")}
+        users = {}
+        for row in connection.execute("SELECT id, name, username FROM users WHERE id BETWEEN 1 AND 7"):
+            users[row["name"]] = row["id"]
+            users[row["username"]] = row["id"]
+        for line_number, row in enumerate(reader, start=2):
+            if line_number > 1001:
+                errors.append("1000行を超えるCSVは読み込めません")
+                break
+            value = lambda field: str(row.get(columns[field], "") or "").strip() if columns[field] else ""
+            project_name = value("project")
+            data = {
+                "title": value("title"), "project_id": projects.get(project_name),
+                "assignee_id": users.get(value("assignee")) if value("assignee") else None,
+                "start_date": value("start_date"), "due_date": value("due_date"),
+                "priority": PRIORITY_IMPORT.get(value("priority") or "medium"),
+                "status": STATUS_IMPORT.get(value("status") or "todo"),
+                "progress": value("progress") or 0, "description": value("description"),
+            }
+            if project_name not in projects:
+                errors.append(f"{line_number}行目: プロジェクト「{project_name}」が見つかりません")
+                continue
+            assignee = value("assignee")
+            if assignee and assignee not in users:
+                errors.append(f"{line_number}行目: 担当者「{assignee}」が見つかりません")
+                continue
+            if data["priority"] is None or data["status"] is None:
+                errors.append(f"{line_number}行目: 優先度またはステータスが正しくありません")
+                continue
+            error = validate_task_data(connection, data)
+            if error or data["due_date"] < data["start_date"]:
+                errors.append(f"{line_number}行目: {error or '期限は開始日以降にしてください'}")
+                continue
+            if data["status"] == "done" or data["progress"] == 100:
+                data["status"], data["progress"] = "done", 100
+            prepared.append(data)
+        if errors:
+            return jsonify(error="CSVを読み込めません", details=errors[:20]), 400
+        if not prepared:
+            return jsonify(error="登録できるタスクがありません"), 400
+        connection.executemany(
+            """INSERT INTO tasks(project_id, title, assignee_id, start_date, due_date, priority, status, progress, description)
+               VALUES (:project_id, :title, :assignee_id, :start_date, :due_date, :priority, :status, :progress, :description)""",
+            prepared,
+        )
+    return jsonify(imported=len(prepared)), 201
 
 
 @app.get("/api/bootstrap")
@@ -1137,8 +1261,9 @@ def gemini_generate(prompt: str) -> str | None:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -1284,6 +1409,7 @@ def health():
         database=database,
         scheduler_enabled=os.environ.get("TEAMFLOW_ENABLE_SCHEDULER") == "1",
         gemini_configured=bool(os.environ.get("GEMINI_API_KEY")),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
         line_configured=bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")),
     ), 200 if status == "ok" else 503
 

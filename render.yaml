@@ -2,8 +2,13 @@ services:
   - type: web
     name: teamflow
     runtime: python
+    plan: starter
+    region: singapore
+    branch: main
+    autoDeployTrigger: checksPass
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn server:app --workers 1 --threads 4 --timeout 60
+    healthCheckPath: /api/health
     envVars:
       - key: TEAMFLOW_DB
         value: /var/data/teamflow.db
@@ -13,8 +18,16 @@ services:
         value: "1"
       - key: TEAMFLOW_SECRET_KEY
         generateValue: true
+      - key: TEAMFLOW_INITIAL_PASSWORD
+        sync: false
       - key: TEAMFLOW_ENABLE_SCHEDULER
         value: "1"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
     disk:
       name: teamflow-data
       mountPath: /var/data

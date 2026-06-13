@@ -367,6 +367,11 @@
 - 管理者バックアップ: 管理画面の「DBバックアップを作成」から作成・ダウンロード
 - メンバーパスワード再設定: 管理画面のメンバー一覧から一時パスワードを設定
 - 自動テスト: `python -m unittest discover -s tests -v`
+- CSV移行: 管理画面からタスクをUTF-8 CSVで書き出し・一括読み込み
+
+CSVの列は `title, project, assignee, start_date, due_date, priority, status, progress, description` です。`assignee` はメンバー名またはログインIDを指定できます。日本語の列名にも対応しています。
+
+スマホではHTTPSで公開したTeamFlowをブラウザで開き、「ホーム画面に追加」するとPWAとして起動できます。画面資産のみをキャッシュし、ログイン情報やAPIデータはキャッシュしません。
 
 ### 本番環境変数
 
@@ -379,3 +384,17 @@
 - `LINE_CHANNEL_ACCESS_TOKEN`: LINE Push Messageを有効化
 
 `render.yaml` を使うと、永続ディスク付きのWebサービスとしてデプロイできます。
+
+## Render本番公開
+
+[Renderへデプロイ](https://render.com/deploy?repo=https://github.com/takemura234/TeamFlow)
+
+RenderのBlueprint作成画面で、次の秘密値を入力します。値はGitHubへ保存されません。
+
+- `TEAMFLOW_INITIAL_PASSWORD`: 初回ログイン用パスワード（英字・数字を含む10文字以上を推奨）
+- `GEMINI_API_KEY`: Google AI Studioで発行したGemini APIキー
+- `LINE_CHANNEL_ACCESS_TOKEN`: LINE DevelopersのMessaging APIチャネルで発行したチャネルアクセストークン
+
+構成はSingaporeリージョン、Starterプラン、1GB永続ディスク、CI成功後の自動デプロイです。公開後は `https://<サービス名>.onrender.com/api/health` を開き、`database`, `gemini_configured`, `line_configured` を確認してください。
+
+Gemini APIキーはGoogle AI StudioのAPI Keys画面で作成します。LINEはMessaging APIチャネルを作成し、チャネルアクセストークンを発行します。LINE通知を受ける各メンバーはボットを友だち追加し、TeamFlowの通知設定で自分のLINE User IDを保存してください。
