@@ -649,9 +649,65 @@ def admin_reset_password(user_id: int):
 def create_database_backup() -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     target = BACKUP_DIR / f"teamflow-{datetime.now():%Y%m%d-%H%M%S-%f}.db"
-    with sqlite3.connect(DB_PATH) as source, sqlite3.connect(target) as destination:
+    source = sqlite3.connect(DB_PATH)
+    destination = sqlite3.connect(target)
+    try:
         source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
     return target
+
+
+def validate_database_backup(path: Path) -> None:
+    required_tables = {
+        "users", "projects", "tasks", "comments", "subtasks",
+        "notifications", "ai_logs", "milestones",
+        "user_notification_settings", "line_link_codes",
+    }
+    connection = None
+    try:
+        connection = sqlite3.connect(path)
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise ValueError("データベースが破損しています")
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not required_tables.issubset(tables):
+            raise ValueError("TeamFlowのバックアップではありません")
+        if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            raise ValueError("ユーザー情報が含まれていません")
+    except sqlite3.Error as error:
+        raise ValueError("SQLiteバックアップを読み込めません") from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def copy_database(source_path: Path, destination_path: Path) -> None:
+    source = sqlite3.connect(source_path)
+    destination = sqlite3.connect(destination_path, timeout=30)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+
+
+def restore_database_backup(source_path: Path) -> Path:
+    validate_database_backup(source_path)
+    safety_backup = create_database_backup()
+    try:
+        copy_database(source_path, DB_PATH)
+        init_db()
+    except Exception:
+        copy_database(safety_backup, DB_PATH)
+        raise
+    return safety_backup
 
 
 @app.post("/api/admin/backup")
@@ -669,6 +725,37 @@ def download_backup(filename: str):
     if not target.exists() or target.suffix != ".db":
         return jsonify(error="バックアップが見つかりません"), 404
     return send_file(target, as_attachment=True, download_name=safe_name)
+
+
+@app.post("/api/admin/restore")
+@require_roles("admin")
+def restore_backup():
+    uploaded = request.files.get("file")
+    if not uploaded or not uploaded.filename:
+        return jsonify(error="復元するDBバックアップを選択してください"), 400
+    if not uploaded.filename.lower().endswith(".db"):
+        return jsonify(error=".db形式のバックアップを選択してください"), 400
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = BACKUP_DIR / f"restore-{secrets.token_hex(12)}.db"
+    try:
+        uploaded.save(temporary)
+        if temporary.stat().st_size == 0:
+            return jsonify(error="バックアップファイルが空です"), 400
+        if temporary.stat().st_size > 100 * 1024 * 1024:
+            return jsonify(error="バックアップファイルは100MB以下にしてください"), 413
+        safety_backup = restore_database_backup(temporary)
+    except ValueError as error:
+        return jsonify(error=str(error)), 400
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    session.clear()
+    return jsonify(
+        ok=True,
+        safety_backup=safety_backup.name,
+        message="データを復元しました。復元したアカウントで再ログインしてください。",
+    )
 
 
 CSV_FIELDS = ["title", "project", "assignee", "start_date", "due_date", "priority", "status", "progress", "description"]

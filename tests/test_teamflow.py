@@ -176,6 +176,42 @@ class TeamFlowApiTest(unittest.TestCase):
         self.assertGreater(len(download.data), 0)
         download.close()
 
+    def test_database_can_be_restored_from_uploaded_backup(self):
+        snapshot = server.create_database_backup()
+        with server.db() as connection:
+            connection.execute(
+                "INSERT INTO projects(name, description, start_date, end_date) VALUES (?, ?, ?, ?)",
+                ("Restore marker", "must disappear", "2026-06-14", "2026-06-15"),
+            )
+
+        with snapshot.open("rb") as backup_file:
+            response = self.client.post(
+                "/api/admin/restore",
+                data={"file": (backup_file, "teamflow-backup.db")},
+                headers=self.headers,
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertTrue((server.BACKUP_DIR / result["safety_backup"]).exists())
+        with server.db() as connection:
+            marker = connection.execute(
+                "SELECT id FROM projects WHERE name = ?", ("Restore marker",)
+            ).fetchone()
+        self.assertIsNone(marker)
+        self.assertEqual(self.client.get("/api/bootstrap").status_code, 401)
+
+    def test_database_restore_rejects_invalid_file(self):
+        response = self.client.post(
+            "/api/admin/restore",
+            data={"file": (io.BytesIO(b"not a sqlite database"), "broken.db")},
+            headers=self.headers,
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("SQLite", response.get_json()["error"])
+
     def test_csrf_is_required_for_admin_changes(self):
         response = self.client.post("/api/admin/backup")
         self.assertEqual(response.status_code, 403)

@@ -389,7 +389,9 @@ CSVの列は `title, project, assignee, start_date, due_date, priority, status, 
 - `GEMINI_API_KEY`: Gemini機能を有効化
 - `LINE_CHANNEL_ACCESS_TOKEN`: LINE Push Messageを有効化
 
-`render.yaml` は無料Webサービス用です。SQLiteは一時領域に保存されるため、再起動や再デプロイでデータが初期化される可能性があります。管理画面から定期的にDBバックアップをダウンロードしてください。有料の永続ディスク構成は `render-paid.yaml` に残しています。
+`render.yaml` は無料Webサービス用です。SQLiteは一時領域に保存されるため、再起動や再デプロイでデータが初期化される可能性があります。管理画面の「DBバックアップ」で定期的にPCへ保存してください。データが初期化された場合は「DB復元」で保存済みの `.db` ファイルを選ぶと、整合性検査と現在DBの自動退避後に復元されます。有料の永続ディスク構成は `render-paid.yaml` に残しています。
+
+復元後はバックアップに保存されていたログイン情報で再ログインします。復元操作はプロジェクト、タスク、コメント、通知設定など、TeamFlowの全データをバックアップ時点へ戻します。
 
 ## Render本番公開
 
