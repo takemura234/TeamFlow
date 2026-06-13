@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, send_from_directory, session
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
@@ -35,10 +36,21 @@ app.config.update(
 
 
 def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
     return connection
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    app.logger.exception("Unhandled error on %s", request.path)
+    if request.path.startswith("/api/"):
+        return jsonify(error="サーバー処理に失敗しました。少し待ってから再度お試しください"), 500
+    return "Internal Server Error", 500
 
 
 def rows_to_dicts(rows):
@@ -188,6 +200,7 @@ def init_db() -> None:
     );
     """
     with db() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(schema)
         migrate_users(connection)
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:

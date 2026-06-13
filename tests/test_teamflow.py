@@ -97,6 +97,20 @@ class TeamFlowApiTest(unittest.TestCase):
         self.assertTrue(response.data.startswith(b"\xef\xbb\xbf"))
         self.assertIn("title,project,assignee", response.data.decode("utf-8-sig"))
 
+    def test_admin_can_create_project(self):
+        response = self.client.post(
+            "/api/projects",
+            json={
+                "name": "Production project",
+                "description": "Render registration test",
+                "start_date": "2026-06-13",
+                "end_date": "2026-09-13",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["name"], "Production project")
+
     def test_tasks_can_be_imported_from_csv(self):
         with server.db() as connection:
             project = connection.execute("SELECT name FROM projects ORDER BY id LIMIT 1").fetchone()["name"]
