@@ -10,7 +10,7 @@ from functools import wraps
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from flask import Flask, jsonify, redirect, request, send_file, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
@@ -21,6 +21,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TEAMFLOW_DB", BASE_DIR / "teamflow.db"))
+BACKUP_DIR = Path(os.environ.get("TEAMFLOW_BACKUP_DIR", BASE_DIR / "backups"))
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.config.update(
@@ -510,6 +511,48 @@ def test_line_notification():
     if not send_line_message(account["line_user_id"], "TeamFlowからのテスト通知です。"):
         return jsonify(error="LINE通知の送信に失敗しました"), 502
     return jsonify(ok=True)
+
+
+@app.put("/api/admin/users/<int:user_id>/password")
+@require_roles("admin")
+def admin_reset_password(user_id: int):
+    data = request.get_json(force=True)
+    new_password = data.get("new_password", "")
+    if len(new_password) < 10 or not any(c.isalpha() for c in new_password) or not any(c.isdigit() for c in new_password):
+        return jsonify(error="仮パスワードは英字と数字を含む10文字以上にしてください"), 400
+    with db() as connection:
+        cursor = connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND id BETWEEN 1 AND 7",
+            (generate_password_hash(new_password), user_id),
+        )
+        if cursor.rowcount == 0:
+            return jsonify(error="ユーザーが見つかりません"), 404
+    return jsonify(ok=True)
+
+
+def create_database_backup() -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    target = BACKUP_DIR / f"teamflow-{datetime.now():%Y%m%d-%H%M%S-%f}.db"
+    with sqlite3.connect(DB_PATH) as source, sqlite3.connect(target) as destination:
+        source.backup(destination)
+    return target
+
+
+@app.post("/api/admin/backup")
+@require_roles("admin")
+def create_backup():
+    target = create_database_backup()
+    return jsonify(filename=target.name, size=target.stat().st_size)
+
+
+@app.get("/api/admin/backup/<path:filename>")
+@require_roles("admin")
+def download_backup(filename: str):
+    safe_name = Path(filename).name
+    target = BACKUP_DIR / safe_name
+    if not target.exists() or target.suffix != ".db":
+        return jsonify(error="バックアップが見つかりません"), 404
+    return send_file(target, as_attachment=True, download_name=safe_name)
 
 
 @app.get("/api/bootstrap")
@@ -1227,7 +1270,22 @@ def scheduled_weekly_report() -> None:
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", service="TeamFlow")
+    try:
+        with db() as connection:
+            connection.execute("SELECT 1").fetchone()
+        database = "ok"
+        status = "ok"
+    except sqlite3.Error:
+        database = "error"
+        status = "degraded"
+    return jsonify(
+        status=status,
+        service="TeamFlow",
+        database=database,
+        scheduler_enabled=os.environ.get("TEAMFLOW_ENABLE_SCHEDULER") == "1",
+        gemini_configured=bool(os.environ.get("GEMINI_API_KEY")),
+        line_configured=bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")),
+    ), 200 if status == "ok" else 503
 
 
 init_db()

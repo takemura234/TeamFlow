@@ -364,11 +364,15 @@
 - 週次レポート: AI画面から手動生成、または毎週月曜8時に自動生成
 - 日次通知チェック: 毎日8時5分に自動実行
 - SQLiteバックアップ: `python backup_db.py` で `backups/` に保存
+- 管理者バックアップ: 管理画面の「DBバックアップを作成」から作成・ダウンロード
+- メンバーパスワード再設定: 管理画面のメンバー一覧から一時パスワードを設定
+- 自動テスト: `python -m unittest discover -s tests -v`
 
 ### 本番環境変数
 
 - `TEAMFLOW_SECRET_KEY`: セッション署名用の十分に長いランダム値
 - `TEAMFLOW_DB`: DBファイルパス。Renderでは `/var/data/teamflow.db`
+- `TEAMFLOW_BACKUP_DIR`: バックアップ保存先。Renderでは `/var/data/backups`
 - `TEAMFLOW_COOKIE_SECURE=1`: HTTPS限定Cookie
 - `TEAMFLOW_ENABLE_SCHEDULER=1`: 日次通知・週次レポートを有効化
 - `GEMINI_API_KEY`: Gemini機能を有効化

@@ -7,6 +7,8 @@ services:
     envVars:
       - key: TEAMFLOW_DB
         value: /var/data/teamflow.db
+      - key: TEAMFLOW_BACKUP_DIR
+        value: /var/data/backups
       - key: TEAMFLOW_COOKIE_SECURE
         value: "1"
       - key: TEAMFLOW_SECRET_KEY
