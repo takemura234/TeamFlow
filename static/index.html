@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TeamFlow</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    .task-link{border:0;background:none;padding:0;color:var(--ink);font:inherit;font-weight:700;text-align:left;cursor:pointer}.task-link:hover{color:var(--green);text-decoration:underline}
+    .detail-dialog{width:min(720px,calc(100% - 28px));max-height:88vh}.detail-shell{padding:28px;max-height:88vh;overflow:auto}.detail-meta{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.detail-meta span{padding:6px 10px;border-radius:14px;background:#edf1ec;color:var(--muted);font-size:12px}.detail-description{color:var(--muted);line-height:1.7}.detail-section{margin-top:26px;padding-top:22px;border-top:1px solid var(--line)}.section-title{display:flex;align-items:center;justify-content:space-between}.section-title h4{margin:0 0 14px}.section-title span,.empty-note{color:var(--muted);font-size:12px}.subtask-list,.comment-list{display:grid;gap:8px}.subtask-item{display:flex;align-items:center;gap:10px;background:#f6f8f4;padding:11px 12px}.subtask-item.done span{text-decoration:line-through;color:var(--muted)}.subtask-item button{margin-left:auto;border:0;background:none;cursor:pointer}.inline-form,.comment-form{display:flex;gap:8px;margin-top:12px}.inline-form input,.comment-form textarea{flex:1}.comment-item{padding:14px 0;border-bottom:1px solid var(--line)}.comment-item header{display:flex;justify-content:space-between;margin-bottom:6px}.comment-item small{color:var(--muted)}.comment-item p{margin:0;white-space:pre-wrap;line-height:1.6}
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">TF</span><div><strong>TeamFlow</strong><small>開発チーム管理</small></div></div>
+      <nav>
+        <button class="nav-item active" data-view="dashboard"><span>◫</span>ダッシュボード</button>
+        <button class="nav-item" data-view="tasks"><span>✓</span>タスク</button>
+        <button class="nav-item" data-view="gantt"><span>▥</span>ガントチャート</button>
+        <button class="nav-item" data-view="ai"><span>✦</span>AIアドバイザー</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-view="settings"><span>⚙</span>通知設定</button>
+        <div class="profile"><div class="avatar">武</div><div><strong>武田 TL</strong><small>管理者</small></div></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button id="menuButton" class="icon-button menu-button">☰</button>
+        <div><p class="eyebrow">PROJECT WORKSPACE</p><h1 id="pageTitle">ダッシュボード</h1></div>
+        <div class="top-actions"><button id="notificationButton" class="icon-button">♢<span id="notificationCount" class="badge">0</span></button><button id="newTaskButton" class="primary-button">＋ タスクを追加</button></div>
+      </header>
+
+      <section id="dashboardView" class="view active">
+        <div class="hero">
+          <div><p class="eyebrow">2026 PRODUCT DEVELOPMENT</p><h2>チームの流れを、<br><em>ひとつ先へ。</em></h2><p>優先順位と進捗をそろえて、次に動くべき仕事を明確にします。</p></div>
+          <div class="hero-date"><span id="todayDay"></span><small id="todayLabel"></small></div>
+        </div>
+        <div id="summaryCards" class="summary-grid"></div>
+        <div class="dashboard-grid">
+          <section class="panel"><div class="panel-head"><div><p class="eyebrow">PRIORITY QUEUE</p><h3>今週の重要タスク</h3></div><button class="text-button" data-go="tasks">すべて見る →</button></div><div id="priorityTasks" class="task-list"></div></section>
+          <section class="panel"><div class="panel-head"><div><p class="eyebrow">RISK SIGNAL</p><h3>遅延リスク</h3></div><span class="live-dot">LIVE</span></div><div id="riskTasks" class="risk-list"></div></section>
+        </div>
+        <section class="panel"><div class="panel-head"><div><p class="eyebrow">TEAM PULSE</p><h3>メンバー別の進捗</h3></div></div><div id="teamProgress" class="team-grid"></div></section>
+      </section>
+
+      <section id="tasksView" class="view">
+        <div class="toolbar"><div class="filter-group"><button class="filter active" data-status="all">すべて</button><button class="filter" data-status="todo">未着手</button><button class="filter" data-status="in_progress">進行中</button><button class="filter" data-status="review">レビュー</button><button class="filter" data-status="done">完了</button></div><input id="taskSearch" type="search" placeholder="タスクを検索"></div>
+        <div class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>タスク</th><th>担当</th><th>期限</th><th>優先度</th><th>進捗</th><th>状態</th><th></th></tr></thead><tbody id="taskTable"></tbody></table></div></div>
+      </section>
+
+      <section id="ganttView" class="view"><div class="panel"><div class="panel-head"><div><p class="eyebrow">TIMELINE</p><h3>プロジェクト工程</h3></div><span class="legend"><i></i> 今日</span></div><div id="ganttChart" class="gantt"></div></div></section>
+
+      <section id="aiView" class="view"><div class="ai-layout"><section class="ai-intro"><span class="ai-orb">✦</span><p class="eyebrow">TEAMFLOW AI</p><h2>チームの状況を踏まえて、<br>次の一手を整理します。</h2><p>タスク名、期限、進捗だけを使い、プロジェクトの優先順位や遅延対策を提案します。</p><div class="prompt-chips"><button>今週、一番リスクの高いタスクは？</button><button>優先順位を整理して</button><button>遅延を防ぐために何をすべき？</button></div></section><section class="chat-panel"><div id="chatMessages" class="chat-messages"><div class="message assistant">こんにちは。TeamFlowのタスク状況をもとに、進め方を一緒に整理します。</div></div><form id="chatForm" class="chat-form"><textarea id="chatInput" rows="2" placeholder="チームの状況について相談する"></textarea><button class="primary-button" type="submit">送信</button></form></section></div></section>
+
+      <section id="settingsView" class="view"><div class="settings-grid"><section class="panel"><p class="eyebrow">NOTIFICATIONS</p><h3>通知チャンネル</h3><label class="setting-row"><span><strong>アプリ内通知</strong><small>期限・進捗・緊急タスクを通知します</small></span><input type="checkbox" checked></label><label class="setting-row"><span><strong>LINE通知</strong><small>環境変数設定後にMessaging APIと連携します</small></span><input type="checkbox"></label><label class="setting-row"><span><strong>週次サマリー</strong><small>毎週月曜にチーム状況をまとめます</small></span><input type="checkbox" checked></label></section><section class="panel"><p class="eyebrow">INBOX</p><h3>最近の通知</h3><div id="notificationList" class="notification-list"></div></section></div></section>
+    </main>
+  </div>
+
+  <dialog id="taskDialog"><form id="taskForm" method="dialog"><div class="dialog-head"><div><p class="eyebrow">NEW TASK</p><h3>タスクを追加</h3></div><button type="button" class="icon-button" data-close>×</button></div><input type="hidden" name="id"><div class="form-grid"><label class="full">タスク名<input name="title" required maxlength="120"></label><label>担当者<select name="assignee_id"></select></label><label>優先度<select name="priority"><option value="high">高</option><option value="medium" selected>中</option><option value="low">低</option></select></label><label>開始日<input name="start_date" type="date" required></label><label>期限<input name="due_date" type="date" required></label><label class="full">説明<textarea name="description" rows="3"></textarea></label></div><div class="dialog-actions"><button type="button" class="secondary-button" data-close>キャンセル</button><button class="primary-button" type="submit">保存する</button></div></form></dialog>
+  <dialog id="detailDialog" class="detail-dialog"><div class="detail-shell"><div class="dialog-head"><div><p class="eyebrow">TASK DETAIL</p><h3 id="detailTitle">タスク詳細</h3></div><button type="button" class="icon-button" data-detail-close>×</button></div><div id="detailMeta" class="detail-meta"></div><p id="detailDescription" class="detail-description"></p><section class="detail-section"><div class="section-title"><h4>サブタスク</h4><span id="subtaskCount"></span></div><div id="subtaskList" class="subtask-list"></div><form id="subtaskForm" class="inline-form"><input name="title" placeholder="サブタスクを追加" maxlength="120" required><button class="secondary-button" type="submit">追加</button></form></section><section class="detail-section"><div class="section-title"><h4>コメント</h4></div><form id="commentForm" class="comment-form"><textarea name="body" rows="2" placeholder="進捗や懸念点を共有" required></textarea><button class="primary-button" type="submit">投稿</button></form><div id="commentList" class="comment-list"></div></section></div></dialog>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
