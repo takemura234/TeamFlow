@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 import urllib.error
 import urllib.request
+from functools import wraps
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_from_directory, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("TEAMFLOW_DB", BASE_DIR / "teamflow.db"))
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config.update(
+    SECRET_KEY=os.environ.get("TEAMFLOW_SECRET_KEY", "teamflow-development-secret-change-me"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("TEAMFLOW_COOKIE_SECURE") == "1",
+)
 
 
 def db() -> sqlite3.Connection:
@@ -26,6 +35,70 @@ def db() -> sqlite3.Connection:
 
 def rows_to_dicts(rows):
     return [dict(row) for row in rows]
+
+
+def migrate_users(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+    if "username" not in columns:
+        connection.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if "password_hash" not in columns:
+        connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+
+    initial_password = os.environ.get("TEAMFLOW_INITIAL_PASSWORD", "TeamFlow2026!")
+    users = connection.execute("SELECT id, role, username, password_hash FROM users ORDER BY id").fetchall()
+    for user in users:
+        username = user["username"] or ("admin" if user["role"] == "admin" else f"member{user['id']}")
+        password_hash = user["password_hash"] or generate_password_hash(initial_password)
+        connection.execute(
+            "UPDATE users SET username = ?, password_hash = ? WHERE id = ?",
+            (username, password_hash, user["id"]),
+        )
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+
+
+def migrate_team_members(connection: sqlite3.Connection) -> None:
+    team = [
+        (1, "武村TL", "admin", "admin"),
+        (2, "中村", "member", "nakamura"),
+        (3, "岡田", "member", "okada"),
+        (4, "磯貝", "member", "isogai"),
+        (5, "水野", "member", "mizuno"),
+        (6, "淵田", "member", "fuchida"),
+        (7, "榊原", "member", "sakakibara"),
+    ]
+    initial_password = os.environ.get("TEAMFLOW_INITIAL_PASSWORD", "TeamFlow2026!")
+    for user_id, name, role, username in team:
+        existing = connection.execute("SELECT id, password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+        if existing:
+            connection.execute(
+                "UPDATE users SET name = ?, role = ?, username = ? WHERE id = ?",
+                (name, role, username, user_id),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO users(id, name, role, username, password_hash) VALUES (?, ?, ?, ?, ?)",
+                (user_id, name, role, username, generate_password_hash(initial_password)),
+            )
+
+
+def migrate_notifications(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(notifications)")}
+    additions = {
+        "user_id": "INTEGER",
+        "task_id": "INTEGER",
+        "event_key": "TEXT",
+        "read_at": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE notifications ADD COLUMN {name} {definition}")
+    connection.execute("UPDATE notifications SET user_id = 1 WHERE user_id IS NULL")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_user ON notifications(event_key, user_id) WHERE event_key IS NOT NULL"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)"
+    )
 
 
 def init_db() -> None:
@@ -87,16 +160,95 @@ def init_db() -> None:
         response TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS milestones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        due_date TEXT NOT NULL,
+        achieved_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS user_notification_settings (
+        user_id INTEGER PRIMARY KEY,
+        in_app_enabled INTEGER NOT NULL DEFAULT 1,
+        line_enabled INTEGER NOT NULL DEFAULT 0,
+        weekly_summary_enabled INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
     """
     with db() as connection:
         connection.executescript(schema)
+        migrate_users(connection)
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             seed(connection)
+            migrate_users(connection)
+        migrate_team_members(connection)
+        migrate_notifications(connection)
+        connection.execute(
+            """INSERT OR IGNORE INTO user_notification_settings(user_id)
+               SELECT id FROM users WHERE id BETWEEN 1 AND 7"""
+        )
+
+
+def add_notification(
+    connection: sqlite3.Connection,
+    user_id: int,
+    notification_type: str,
+    body: str,
+    event_key: str,
+    task_id: int | None = None,
+) -> bool:
+    enabled = connection.execute(
+        "SELECT in_app_enabled FROM user_notification_settings WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if enabled is not None and not enabled["in_app_enabled"]:
+        return False
+    cursor = connection.execute(
+        """INSERT OR IGNORE INTO notifications(user_id, task_id, type, body, event_key)
+           VALUES (?, ?, ?, ?, ?)""",
+        (user_id, task_id, notification_type, body, event_key),
+    )
+    return cursor.rowcount > 0
+
+
+def run_notification_checks(connection: sqlite3.Connection) -> int:
+    today = date.today().isoformat()
+    created = 0
+    admin_id = 1
+    tasks = connection.execute(
+        """SELECT t.id, t.title, t.assignee_id, t.due_date, t.progress, t.updated_at, u.name AS assignee_name,
+                  CAST(julianday(t.due_date) - julianday(date('now')) AS INTEGER) AS days_left
+           FROM tasks t LEFT JOIN users u ON u.id = t.assignee_id
+           WHERE t.status != 'done'"""
+    ).fetchall()
+    for task in tasks:
+        assignee_id = task["assignee_id"]
+        if 0 <= task["days_left"] <= 3 and task["progress"] < 50:
+            body = f"「{task['title']}」は期限まで{task['days_left']}日、進捗{task['progress']}%です。遅延リスクを確認してください。"
+            for user_id in {admin_id, assignee_id} - {None}:
+                created += add_notification(
+                    connection, user_id, "risk", body, f"risk:{task['id']}:{today}", task["id"]
+                )
+        if task["days_left"] < 0:
+            body = f"「{task['title']}」が期限を{abs(task['days_left'])}日超過しています。担当：{task['assignee_name'] or '未割当'}"
+            created += add_notification(
+                connection, admin_id, "overdue", body, f"overdue:{task['id']}:{today}", task["id"]
+            )
+        stale = connection.execute(
+            "SELECT datetime(?) <= datetime('now', '-7 days')", (task["updated_at"],)
+        ).fetchone()[0]
+        if stale and assignee_id:
+            body = f"「{task['title']}」は7日以上更新されていません。進捗を更新してください。"
+            created += add_notification(
+                connection, assignee_id, "stale", body, f"stale:{task['id']}:{today}", task["id"]
+            )
+    return created
 
 
 def seed(connection: sqlite3.Connection) -> None:
     today = date.today()
-    users = [("武田 TL", "admin"), ("田中", "member"), ("横井", "member"), ("佐藤", "member"), ("鈴木", "member")]
+    users = [("武村TL", "admin"), ("中村", "member"), ("岡田", "member"), ("磯貝", "member"), ("水野", "member")]
     connection.executemany("INSERT INTO users(name, role) VALUES (?, ?)", users)
     connection.execute(
         "INSERT INTO projects(name, description, start_date, end_date) VALUES (?, ?, ?, ?)",
@@ -125,6 +277,109 @@ def seed(connection: sqlite3.Connection) -> None:
     )
 
 
+def current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    with db() as connection:
+        return connection.execute(
+            "SELECT id, name, username, role FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+
+
+def require_roles(*roles):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            user = current_user()
+            if user is None:
+                return jsonify(error="ログインが必要です"), 401
+            if roles and user["role"] not in roles:
+                return jsonify(error="この操作を行う権限がありません"), 403
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def can_edit_task(connection: sqlite3.Connection, task_id: int) -> bool:
+    user = current_user()
+    if user is None:
+        return False
+    if user["role"] == "admin":
+        return True
+    task = connection.execute("SELECT assignee_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return bool(task and user["role"] == "member" and task["assignee_id"] == user["id"])
+
+
+TASK_PRIORITIES = {"high", "medium", "low"}
+TASK_STATUSES = {"todo", "in_progress", "review", "done", "hold"}
+
+
+def validate_task_data(connection: sqlite3.Connection, data: dict, partial: bool = False):
+    required = ("title", "project_id", "start_date", "due_date")
+    if not partial and any(not data.get(field) for field in required):
+        return "必須項目を入力してください"
+    if "title" in data:
+        data["title"] = str(data["title"]).strip()
+        if not data["title"]:
+            return "タスク名を入力してください"
+        if len(data["title"]) > 120:
+            return "タスク名は120文字以内で入力してください"
+    if "project_id" in data:
+        try:
+            data["project_id"] = int(data["project_id"])
+        except (TypeError, ValueError):
+            return "プロジェクトが正しくありません"
+        if connection.execute("SELECT 1 FROM projects WHERE id = ?", (data["project_id"],)).fetchone() is None:
+            return "プロジェクトが見つかりません"
+    if "assignee_id" in data:
+        data["assignee_id"] = data["assignee_id"] or None
+        if data["assignee_id"] is not None:
+            try:
+                data["assignee_id"] = int(data["assignee_id"])
+            except (TypeError, ValueError):
+                return "担当者が正しくありません"
+            if connection.execute("SELECT 1 FROM users WHERE id = ?", (data["assignee_id"],)).fetchone() is None:
+                return "担当者が見つかりません"
+    for field in ("start_date", "due_date"):
+        if field in data:
+            try:
+                date.fromisoformat(data[field])
+            except (TypeError, ValueError):
+                return "日付が正しくありません"
+    if "priority" in data and data["priority"] not in TASK_PRIORITIES:
+        return "優先度が正しくありません"
+    if "status" in data and data["status"] not in TASK_STATUSES:
+        return "ステータスが正しくありません"
+    if "progress" in data:
+        try:
+            data["progress"] = int(data["progress"])
+        except (TypeError, ValueError):
+            return "進捗が正しくありません"
+        if not 0 <= data["progress"] <= 100:
+            return "進捗は0%から100%で入力してください"
+    if "description" in data:
+        data["description"] = str(data["description"] or "").strip()
+    if "update_comment" in data:
+        data["update_comment"] = str(data["update_comment"] or "").strip()
+        if len(data["update_comment"]) > 1000:
+            return "更新コメントは1000文字以内で入力してください"
+    return None
+
+
+@app.before_request
+def protect_api():
+    if not request.path.startswith("/api/") or request.path in {"/api/session", "/api/health"}:
+        return None
+    if current_user() is None:
+        return jsonify(error="ログインが必要です"), 401
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        token = request.headers.get("X-CSRF-Token")
+        if not token or not secrets.compare_digest(token, session.get("csrf_token", "")):
+            return jsonify(error="セキュリティトークンが無効です"), 403
+    return None
+
+
 TASK_SELECT = """
 SELECT t.*, u.name AS assignee_name, p.name AS project_name,
        CAST(julianday(t.due_date) - julianday(date('now')) AS INTEGER) AS days_left
@@ -136,17 +391,356 @@ LEFT JOIN users u ON u.id = t.assignee_id
 
 @app.get("/")
 def index():
+    if current_user() is None:
+        return redirect("/login")
     return send_from_directory(BASE_DIR / "static", "index.html")
+
+
+@app.get("/login")
+def login_page():
+    return send_from_directory(BASE_DIR / "static", "login.html")
+
+
+@app.route("/api/session", methods=["GET", "POST", "DELETE"])
+def user_session():
+    if request.method == "GET":
+        user = current_user()
+        if user is None:
+            return jsonify(authenticated=False), 401
+        return jsonify(authenticated=True, user=dict(user), csrf_token=session["csrf_token"])
+
+    if request.method == "DELETE":
+        session.clear()
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    with db() as connection:
+        user = connection.execute(
+            "SELECT id, name, username, role, password_hash FROM users WHERE username = ?", (username,)
+        ).fetchone()
+    if user is None or not check_password_hash(user["password_hash"], password):
+        return jsonify(error="ログインIDまたはパスワードが違います"), 401
+    session.clear()
+    session["user_id"] = user["id"]
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return jsonify(
+        user={key: user[key] for key in ("id", "name", "username", "role")},
+        csrf_token=session["csrf_token"],
+    )
 
 
 @app.get("/api/bootstrap")
 def bootstrap():
+    user = current_user()
     with db() as connection:
+        run_notification_checks(connection)
         tasks = rows_to_dicts(connection.execute(TASK_SELECT + " ORDER BY t.due_date").fetchall())
-        projects = rows_to_dicts(connection.execute("SELECT * FROM projects ORDER BY id").fetchall())
-        users = rows_to_dicts(connection.execute("SELECT * FROM users ORDER BY id").fetchall())
-        notifications = rows_to_dicts(connection.execute("SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT 20").fetchall())
-    return jsonify(tasks=tasks, projects=projects, users=users, notifications=notifications)
+        projects = rows_to_dicts(connection.execute(
+            """SELECT p.*,
+                      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count,
+                      (SELECT COUNT(*) FROM milestones m WHERE m.project_id = p.id) AS milestone_count
+               FROM projects p ORDER BY p.start_date, p.id"""
+        ).fetchall())
+        user_fields = "id, name, role, username" if user["role"] == "admin" else "id, name, role"
+        users = rows_to_dicts(connection.execute(
+            f"SELECT {user_fields} FROM users WHERE id BETWEEN 1 AND 7 ORDER BY id"
+        ).fetchall())
+        notifications = rows_to_dicts(connection.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50",
+            (user["id"],),
+        ).fetchall())
+        milestones = rows_to_dicts(connection.execute(
+            """SELECT m.*, p.name AS project_name,
+                      CAST(julianday(m.due_date) - julianday(date('now')) AS INTEGER) AS days_left
+               FROM milestones m JOIN projects p ON p.id = m.project_id
+               ORDER BY m.due_date, m.id"""
+        ).fetchall())
+        notification_settings = dict(connection.execute(
+            "SELECT * FROM user_notification_settings WHERE user_id = ?", (user["id"],)
+        ).fetchone())
+    return jsonify(
+        tasks=tasks,
+        projects=projects,
+        users=users,
+        notifications=notifications,
+        milestones=milestones,
+        notification_settings=notification_settings,
+        current_user=dict(user),
+        csrf_token=session["csrf_token"],
+    )
+
+
+@app.get("/api/notifications")
+def list_notifications():
+    user = current_user()
+    with db() as connection:
+        notifications = rows_to_dicts(connection.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50",
+            (user["id"],),
+        ).fetchall())
+    return jsonify(notifications)
+
+
+@app.put("/api/notifications/<int:notification_id>/read")
+def read_notification(notification_id: int):
+    user = current_user()
+    with db() as connection:
+        cursor = connection.execute(
+            """UPDATE notifications SET is_read = 1, read_at = ?
+               WHERE id = ? AND user_id = ?""",
+            (datetime.now().isoformat(timespec="seconds"), notification_id, user["id"]),
+        )
+        if cursor.rowcount == 0:
+            return jsonify(error="通知が見つかりません"), 404
+        notification = dict(connection.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone())
+    return jsonify(notification)
+
+
+@app.put("/api/notifications/read-all")
+def read_all_notifications():
+    user = current_user()
+    with db() as connection:
+        connection.execute(
+            """UPDATE notifications SET is_read = 1, read_at = ?
+               WHERE user_id = ? AND is_read = 0""",
+            (datetime.now().isoformat(timespec="seconds"), user["id"]),
+        )
+    return jsonify(ok=True)
+
+
+@app.post("/api/notifications/check")
+@require_roles("admin")
+def check_notifications():
+    with db() as connection:
+        created = run_notification_checks(connection)
+        notifications = rows_to_dicts(connection.execute(
+            "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50",
+            (current_user()["id"],),
+        ).fetchall())
+    return jsonify(created=created, notifications=notifications)
+
+
+@app.get("/api/users")
+@require_roles("admin")
+def list_users():
+    with db() as connection:
+        users = rows_to_dicts(connection.execute(
+            "SELECT id, name, username, role FROM users WHERE id BETWEEN 1 AND 7 ORDER BY id"
+        ).fetchall())
+    return jsonify(users)
+
+
+def validate_project_data(data: dict, partial: bool = False):
+    if not partial or "name" in data:
+        data["name"] = str(data.get("name", "")).strip()
+        if not data["name"]:
+            return "プロジェクト名を入力してください"
+        if len(data["name"]) > 120:
+            return "プロジェクト名は120文字以内で入力してください"
+    if "description" in data:
+        data["description"] = str(data["description"] or "").strip()
+    for field in ("start_date", "end_date"):
+        if not partial or field in data:
+            try:
+                date.fromisoformat(data.get(field, ""))
+            except (TypeError, ValueError):
+                return "日付が正しくありません"
+    return None
+
+
+@app.get("/api/projects")
+def list_projects():
+    with db() as connection:
+        projects = rows_to_dicts(connection.execute(
+            """SELECT p.*,
+                      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count,
+                      (SELECT COUNT(*) FROM milestones m WHERE m.project_id = p.id) AS milestone_count
+               FROM projects p ORDER BY p.start_date, p.id"""
+        ).fetchall())
+    return jsonify(projects)
+
+
+@app.post("/api/projects")
+@require_roles("admin")
+def create_project():
+    data = request.get_json(force=True)
+    error = validate_project_data(data)
+    if error:
+        return jsonify(error=error), 400
+    if data["end_date"] < data["start_date"]:
+        return jsonify(error="終了日は開始日以降にしてください"), 400
+    with db() as connection:
+        cursor = connection.execute(
+            """INSERT INTO projects(name, description, start_date, end_date)
+               VALUES (?, ?, ?, ?)""",
+            (data["name"], data.get("description", ""), data["start_date"], data["end_date"]),
+        )
+        project = dict(connection.execute(
+            """SELECT p.*, 0 AS task_count, 0 AS milestone_count
+               FROM projects p WHERE p.id = ?""",
+            (cursor.lastrowid,),
+        ).fetchone())
+    return jsonify(project), 201
+
+
+@app.put("/api/projects/<int:project_id>")
+@require_roles("admin")
+def update_project(project_id: int):
+    data = request.get_json(force=True)
+    allowed = {key: value for key, value in data.items() if key in {"name", "description", "start_date", "end_date"}}
+    if not allowed:
+        return jsonify(error="更新項目がありません"), 400
+    with db() as connection:
+        existing = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if existing is None:
+            return jsonify(error="プロジェクトが見つかりません"), 404
+        error = validate_project_data(allowed, partial=True)
+        if error:
+            return jsonify(error=error), 400
+        start_date = allowed.get("start_date", existing["start_date"])
+        end_date = allowed.get("end_date", existing["end_date"])
+        if end_date < start_date:
+            return jsonify(error="終了日は開始日以降にしてください"), 400
+        assignments = ", ".join(f"{key} = ?" for key in allowed)
+        connection.execute(
+            f"UPDATE projects SET {assignments} WHERE id = ?", (*allowed.values(), project_id)
+        )
+        project = dict(connection.execute(
+            """SELECT p.*,
+                      (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count,
+                      (SELECT COUNT(*) FROM milestones m WHERE m.project_id = p.id) AS milestone_count
+               FROM projects p WHERE p.id = ?""",
+            (project_id,),
+        ).fetchone())
+    return jsonify(project)
+
+
+@app.delete("/api/projects/<int:project_id>")
+@require_roles("admin")
+def delete_project(project_id: int):
+    with db() as connection:
+        project = connection.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if project is None:
+            return jsonify(error="プロジェクトが見つかりません"), 404
+        task_count = connection.execute("SELECT COUNT(*) FROM tasks WHERE project_id = ?", (project_id,)).fetchone()[0]
+        milestone_count = connection.execute("SELECT COUNT(*) FROM milestones WHERE project_id = ?", (project_id,)).fetchone()[0]
+        if task_count or milestone_count:
+            return jsonify(error="タスクまたはマイルストーンがあるプロジェクトは削除できません"), 409
+        connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return "", 204
+
+
+@app.get("/api/milestones")
+def list_milestones():
+    with db() as connection:
+        milestones = rows_to_dicts(connection.execute(
+            """SELECT m.*, p.name AS project_name,
+                      CAST(julianday(m.due_date) - julianday(date('now')) AS INTEGER) AS days_left
+               FROM milestones m JOIN projects p ON p.id = m.project_id
+               ORDER BY m.due_date, m.id"""
+        ).fetchall())
+    return jsonify(milestones)
+
+
+@app.post("/api/milestones")
+@require_roles("admin")
+def create_milestone():
+    data = request.get_json(force=True)
+    name = str(data.get("name", "")).strip()
+    due_date = data.get("due_date", "")
+    try:
+        project_id = int(data.get("project_id"))
+        date.fromisoformat(due_date)
+    except (TypeError, ValueError):
+        return jsonify(error="入力内容が正しくありません"), 400
+    if not name:
+        return jsonify(error="マイルストーン名を入力してください"), 400
+    with db() as connection:
+        if connection.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
+            return jsonify(error="プロジェクトが見つかりません"), 404
+        cursor = connection.execute(
+            "INSERT INTO milestones(project_id, name, due_date) VALUES (?, ?, ?)",
+            (project_id, name, due_date),
+        )
+        milestone = dict(connection.execute(
+            """SELECT m.*, p.name AS project_name,
+                      CAST(julianday(m.due_date) - julianday(date('now')) AS INTEGER) AS days_left
+               FROM milestones m JOIN projects p ON p.id = m.project_id WHERE m.id = ?""",
+            (cursor.lastrowid,),
+        ).fetchone())
+    return jsonify(milestone), 201
+
+
+@app.put("/api/milestones/<int:milestone_id>")
+@require_roles("admin")
+def update_milestone(milestone_id: int):
+    data = request.get_json(force=True)
+    achieved = data.get("achieved")
+    if not isinstance(achieved, bool):
+        return jsonify(error="達成状態が正しくありません"), 400
+    with db() as connection:
+        existing = connection.execute(
+            "SELECT achieved_at FROM milestones WHERE id = ?", (milestone_id,)
+        ).fetchone()
+        if existing is None:
+            return jsonify(error="マイルストーンが見つかりません"), 404
+        cursor = connection.execute(
+            "UPDATE milestones SET achieved_at = ? WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds") if achieved else None, milestone_id),
+        )
+        if cursor.rowcount == 0:
+            return jsonify(error="マイルストーンが見つかりません"), 404
+        milestone = dict(connection.execute(
+            """SELECT m.*, p.name AS project_name,
+                      CAST(julianday(m.due_date) - julianday(date('now')) AS INTEGER) AS days_left
+               FROM milestones m JOIN projects p ON p.id = m.project_id WHERE m.id = ?""",
+            (milestone_id,),
+        ).fetchone())
+        if achieved and not existing["achieved_at"]:
+            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 7"):
+                add_notification(
+                    connection,
+                    recipient["id"],
+                    "milestone",
+                    f"マイルストーン「{milestone['name']}」を達成しました。",
+                    f"milestone:{milestone_id}:achieved",
+                )
+    return jsonify(milestone)
+
+
+@app.delete("/api/milestones/<int:milestone_id>")
+@require_roles("admin")
+def delete_milestone(milestone_id: int):
+    with db() as connection:
+        cursor = connection.execute("DELETE FROM milestones WHERE id = ?", (milestone_id,))
+    return ("", 204) if cursor.rowcount else (jsonify(error="マイルストーンが見つかりません"), 404)
+
+
+@app.put("/api/settings/notifications")
+def update_notification_settings():
+    data = request.get_json(force=True)
+    fields = ("in_app_enabled", "line_enabled", "weekly_summary_enabled")
+    values = []
+    for field in fields:
+        if not isinstance(data.get(field), bool):
+            return jsonify(error="通知設定が正しくありません"), 400
+        values.append(1 if data[field] else 0)
+    user = current_user()
+    with db() as connection:
+        connection.execute(
+            """UPDATE user_notification_settings
+               SET in_app_enabled = ?, line_enabled = ?, weekly_summary_enabled = ?
+               WHERE user_id = ?""",
+            (*values, user["id"]),
+        )
+        settings = dict(connection.execute(
+            "SELECT * FROM user_notification_settings WHERE user_id = ?", (user["id"],)
+        ).fetchone())
+    return jsonify(settings)
 
 
 @app.get("/api/tasks")
@@ -163,26 +757,42 @@ def list_tasks():
 
 
 @app.post("/api/tasks")
+@require_roles("admin", "member")
 def create_task():
     data = request.get_json(force=True)
-    required = ["title", "project_id", "start_date", "due_date"]
-    if any(not data.get(field) for field in required):
-        return jsonify(error="必須項目を入力してください"), 400
-    if data["due_date"] < data["start_date"]:
-        return jsonify(error="期限は開始日以降にしてください"), 400
-    values = (
-        int(data["project_id"]), data["title"].strip(), data.get("assignee_id") or None,
-        data["start_date"], data["due_date"], data.get("priority", "medium"),
-        data.get("status", "todo"), int(data.get("progress", 0)), data.get("description", "").strip(),
-    )
+    user = current_user()
+    if user["role"] == "member":
+        data["assignee_id"] = user["id"]
     with db() as connection:
+        error = validate_task_data(connection, data)
+        if error:
+            return jsonify(error=error), 400
+        if data["due_date"] < data["start_date"]:
+            return jsonify(error="期限は開始日以降にしてください"), 400
+        progress = data.get("progress", 0)
+        status = data.get("status", "todo")
+        if status == "done" or progress == 100:
+            progress, status = 100, "done"
+        values = (
+            data["project_id"], data["title"], data.get("assignee_id"),
+            data["start_date"], data["due_date"], data.get("priority", "medium"),
+            status, progress, data.get("description", ""),
+        )
         cursor = connection.execute(
             """INSERT INTO tasks(project_id, title, assignee_id, start_date, due_date, priority, status, progress, description)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
         )
         task_id = cursor.lastrowid
         if data.get("priority") == "high":
-            connection.execute("INSERT INTO notifications(type, body) VALUES ('urgent', ?)", (f"緊急タスク「{data['title']}」が追加されました。",))
+            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 7"):
+                add_notification(
+                    connection,
+                    recipient["id"],
+                    "urgent",
+                    f"緊急タスクが追加されました：「{data['title']}」",
+                    f"urgent:{task_id}",
+                    task_id,
+                )
         task = dict(connection.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone())
     return jsonify(task), 201
 
@@ -190,25 +800,90 @@ def create_task():
 @app.put("/api/tasks/<int:task_id>")
 def update_task(task_id: int):
     data = request.get_json(force=True)
-    allowed = {"title", "assignee_id", "start_date", "due_date", "priority", "status", "progress", "description"}
+    allowed = {"project_id", "title", "assignee_id", "start_date", "due_date", "priority", "status", "progress", "description", "update_comment"}
+    user = current_user()
+    if user["role"] == "member":
+        allowed = {"status", "progress", "update_comment"}
     updates = {key: value for key, value in data.items() if key in allowed}
     if not updates:
         return jsonify(error="更新項目がありません"), 400
-    if "progress" in updates:
-        updates["progress"] = max(0, min(100, int(updates["progress"])))
-        if updates["progress"] == 100:
-            updates["status"] = "done"
-    assignments = ", ".join(f"{key} = ?" for key in updates)
-    values = list(updates.values()) + [datetime.now().isoformat(timespec="seconds"), task_id]
     with db() as connection:
-        cursor = connection.execute(f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?", values)
+        if not can_edit_task(connection, task_id):
+            return jsonify(error="このタスクを編集する権限がありません"), 403
+        existing = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if existing is None:
+            return jsonify(error="タスクが見つかりません"), 404
+        error = validate_task_data(connection, updates, partial=True)
+        if error:
+            return jsonify(error=error), 400
+        start_date = updates.get("start_date", existing["start_date"])
+        due_date = updates.get("due_date", existing["due_date"])
+        if due_date < start_date:
+            return jsonify(error="期限は開始日以降にしてください"), 400
+        comment = updates.pop("update_comment", "")
+        progress = updates.get("progress", existing["progress"])
+        status = updates.get("status", existing["status"])
+        if updates.get("status") == "done" or ("progress" in updates and progress == 100):
+            updates["progress"], updates["status"] = 100, "done"
+        elif "status" in updates and status != "done" and progress == 100:
+            updates["progress"] = 95
+        if not updates and not comment:
+            return jsonify(error="更新項目がありません"), 400
+        if updates:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            values = list(updates.values()) + [datetime.now().isoformat(timespec="seconds"), task_id]
+            cursor = connection.execute(f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?", values)
+        else:
+            cursor = connection.execute(
+                "UPDATE tasks SET updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(timespec="seconds"), task_id),
+            )
         if cursor.rowcount == 0:
             return jsonify(error="タスクが見つかりません"), 404
+        if comment:
+            connection.execute(
+                "INSERT INTO comments(task_id, author, body) VALUES (?, ?, ?)",
+                (task_id, user["name"], comment),
+            )
         task = dict(connection.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone())
     return jsonify(task)
 
 
+@app.put("/api/tasks/<int:task_id>/schedule")
+@require_roles("admin")
+def update_task_schedule(task_id: int):
+    data = request.get_json(force=True)
+    try:
+        start_date = date.fromisoformat(data.get("start_date", ""))
+        due_date = date.fromisoformat(data.get("due_date", ""))
+    except (TypeError, ValueError):
+        return jsonify(error="日付が正しくありません"), 400
+    if due_date < start_date:
+        return jsonify(error="期限は開始日以降にしてください"), 400
+    with db() as connection:
+        task = connection.execute("SELECT title, start_date, due_date FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None:
+            return jsonify(error="タスクが見つかりません"), 404
+        old_start, old_due = task["start_date"], task["due_date"]
+        connection.execute(
+            """UPDATE tasks SET start_date = ?, due_date = ?, updated_at = ? WHERE id = ?""",
+            (start_date.isoformat(), due_date.isoformat(), datetime.now().isoformat(timespec="seconds"), task_id),
+        )
+        if old_start != start_date.isoformat() or old_due != due_date.isoformat():
+            connection.execute(
+                "INSERT INTO comments(task_id, author, body) VALUES (?, ?, ?)",
+                (
+                    task_id,
+                    current_user()["name"],
+                    f"ガントチャートで期間を変更：{old_start} ～ {old_due} → {start_date.isoformat()} ～ {due_date.isoformat()}",
+                ),
+            )
+        updated = dict(connection.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone())
+    return jsonify(updated)
+
+
 @app.delete("/api/tasks/<int:task_id>")
+@require_roles("admin")
 def delete_task(task_id: int):
     with db() as connection:
         cursor = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -235,6 +910,8 @@ def add_subtask(task_id: int):
     with db() as connection:
         if connection.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
             return jsonify(error="タスクが見つかりません"), 404
+        if not can_edit_task(connection, task_id):
+            return jsonify(error="このタスクを編集する権限がありません"), 403
         count = connection.execute("SELECT COUNT(*) FROM subtasks WHERE task_id = ?", (task_id,)).fetchone()[0]
         if count >= 10:
             return jsonify(error="サブタスクは10件までです"), 400
@@ -247,6 +924,11 @@ def add_subtask(task_id: int):
 def update_subtask(subtask_id: int):
     data = request.get_json(force=True)
     with db() as connection:
+        subtask = connection.execute("SELECT task_id FROM subtasks WHERE id = ?", (subtask_id,)).fetchone()
+        if subtask is None:
+            return jsonify(error="サブタスクが見つかりません"), 404
+        if not can_edit_task(connection, subtask["task_id"]):
+            return jsonify(error="このタスクを編集する権限がありません"), 403
         cursor = connection.execute("UPDATE subtasks SET done = ? WHERE id = ?", (1 if data.get("done") else 0, subtask_id))
         if cursor.rowcount == 0:
             return jsonify(error="サブタスクが見つかりません"), 404
@@ -257,6 +939,11 @@ def update_subtask(subtask_id: int):
 @app.delete("/api/subtasks/<int:subtask_id>")
 def delete_subtask(subtask_id: int):
     with db() as connection:
+        subtask = connection.execute("SELECT task_id FROM subtasks WHERE id = ?", (subtask_id,)).fetchone()
+        if subtask is None:
+            return jsonify(error="サブタスクが見つかりません"), 404
+        if not can_edit_task(connection, subtask["task_id"]):
+            return jsonify(error="このタスクを編集する権限がありません"), 403
         cursor = connection.execute("DELETE FROM subtasks WHERE id = ?", (subtask_id,))
     return ("", 204) if cursor.rowcount else (jsonify(error="サブタスクが見つかりません"), 404)
 
@@ -268,23 +955,38 @@ def add_comment(task_id: int):
     if not body:
         return jsonify(error="コメントを入力してください"), 400
     with db() as connection:
-        cursor = connection.execute("INSERT INTO comments(task_id, author, body) VALUES (?, ?, ?)", (task_id, data.get("author", "武田 TL"), body))
+        if connection.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            return jsonify(error="タスクが見つかりません"), 404
+        cursor = connection.execute(
+            "INSERT INTO comments(task_id, author, body) VALUES (?, ?, ?)",
+            (task_id, current_user()["name"], body),
+        )
         comment = dict(connection.execute("SELECT * FROM comments WHERE id = ?", (cursor.lastrowid,)).fetchone())
     return jsonify(comment), 201
 
 
 @app.get("/api/dashboard")
 def dashboard():
+    project_id = request.args.get("project_id", type=int)
+    where = "WHERE project_id = ?" if project_id else ""
+    params = (project_id,) if project_id else ()
     with db() as connection:
-        summary = dict(connection.execute("""
+        summary = dict(connection.execute(f"""
             SELECT COUNT(*) AS total,
                    SUM(status = 'done') AS completed,
                    SUM(status != 'done' AND due_date < date('now')) AS overdue,
                    SUM(status != 'done' AND due_date BETWEEN date('now') AND date('now', '+3 days') AND progress < 50) AS at_risk,
                    ROUND(AVG(progress)) AS avg_progress
-            FROM tasks
-        """).fetchone())
-        risks = rows_to_dicts(connection.execute(TASK_SELECT + " WHERE t.status != 'done' AND (t.due_date < date('now', '+4 days') OR t.progress < 25) ORDER BY t.due_date LIMIT 5").fetchall())
+            FROM tasks {where}
+        """, params).fetchone())
+        risk_where = "t.status != 'done' AND (t.due_date < date('now', '+4 days') OR t.progress < 25)"
+        risk_params = []
+        if project_id:
+            risk_where += " AND t.project_id = ?"
+            risk_params.append(project_id)
+        risks = rows_to_dicts(connection.execute(
+            TASK_SELECT + f" WHERE {risk_where} ORDER BY t.due_date LIMIT 5", risk_params
+        ).fetchall())
     return jsonify(summary=summary, risks=risks)
 
 
@@ -320,6 +1022,7 @@ def gemini_advice(prompt: str, tasks: list[dict]) -> str | None:
 
 
 @app.post("/api/ai-advice")
+@require_roles("admin")
 def ai_advice():
     data = request.get_json(force=True)
     prompt = data.get("prompt", "").strip()
@@ -337,6 +1040,8 @@ def health():
     return jsonify(status="ok", service="TeamFlow")
 
 
+init_db()
+
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=os.environ.get("FLASK_DEBUG") == "1")
