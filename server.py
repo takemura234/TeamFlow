@@ -90,6 +90,8 @@ def migrate_team_members(connection: sqlite3.Connection) -> None:
         (5, "水野", "member", "mizuno"),
         (6, "淵田", "member", "fuchida"),
         (7, "榊原", "member", "sakakibara"),
+        (8, "廣田GM", "viewer", "hirota"),
+        (9, "山崎部長", "viewer", "yamazaki"),
     ]
     initial_password = os.environ.get("TEAMFLOW_INITIAL_PASSWORD", "TeamFlow2026!")
     for user_id, name, role, username in team:
@@ -219,7 +221,7 @@ def init_db() -> None:
         migrate_notifications(connection)
         connection.execute(
             """INSERT OR IGNORE INTO user_notification_settings(user_id)
-               SELECT id FROM users WHERE id BETWEEN 1 AND 7"""
+               SELECT id FROM users WHERE id BETWEEN 1 AND 9"""
         )
 
 
@@ -273,10 +275,19 @@ def send_line_message(line_user_id: str, message: str) -> bool:
         return False
 
 
+def management_recipient_ids(connection: sqlite3.Connection, weekly_only: bool = False) -> list[int]:
+    query = """SELECT u.id FROM users u
+               JOIN user_notification_settings s ON s.user_id = u.id
+               WHERE u.role IN ('admin', 'viewer')"""
+    if weekly_only:
+        query += " AND s.weekly_summary_enabled = 1"
+    return [row["id"] for row in connection.execute(query)]
+
+
 def run_notification_checks(connection: sqlite3.Connection) -> int:
     today = date.today().isoformat()
     created = 0
-    admin_id = 1
+    management_ids = set(management_recipient_ids(connection))
     tasks = connection.execute(
         """SELECT t.id, t.title, t.assignee_id, t.due_date, t.progress, t.updated_at, u.name AS assignee_name,
                   CAST(julianday(t.due_date) - julianday(date('now')) AS INTEGER) AS days_left
@@ -287,15 +298,16 @@ def run_notification_checks(connection: sqlite3.Connection) -> int:
         assignee_id = task["assignee_id"]
         if 0 <= task["days_left"] <= 3 and task["progress"] < 50:
             body = f"「{task['title']}」は期限まで{task['days_left']}日、進捗{task['progress']}%です。遅延リスクを確認してください。"
-            for user_id in {admin_id, assignee_id} - {None}:
+            for user_id in management_ids | ({assignee_id} if assignee_id else set()):
                 created += add_notification(
                     connection, user_id, "risk", body, f"risk:{task['id']}:{today}", task["id"]
                 )
         if task["days_left"] < 0:
             body = f"「{task['title']}」が期限を{abs(task['days_left'])}日超過しています。担当：{task['assignee_name'] or '未割当'}"
-            created += add_notification(
-                connection, admin_id, "overdue", body, f"overdue:{task['id']}:{today}", task["id"]
-            )
+            for user_id in management_ids:
+                created += add_notification(
+                    connection, user_id, "overdue", body, f"overdue:{task['id']}:{today}", task["id"]
+                )
         stale = connection.execute(
             "SELECT datetime(?) <= datetime('now', '-7 days')", (task["updated_at"],)
         ).fetchone()[0]
@@ -611,7 +623,7 @@ def admin_reset_password(user_id: int):
         return jsonify(error="仮パスワードは英字と数字を含む10文字以上にしてください"), 400
     with db() as connection:
         cursor = connection.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ? AND id BETWEEN 1 AND 7",
+            "UPDATE users SET password_hash = ? WHERE id = ? AND id BETWEEN 1 AND 9",
             (generate_password_hash(new_password), user_id),
         )
         if cursor.rowcount == 0:
@@ -712,7 +724,7 @@ def import_tasks_csv():
     with db() as connection:
         projects = {row["name"]: row["id"] for row in connection.execute("SELECT id, name FROM projects")}
         users = {}
-        for row in connection.execute("SELECT id, name, username FROM users WHERE id BETWEEN 1 AND 7"):
+        for row in connection.execute("SELECT id, name, username FROM users WHERE id BETWEEN 1 AND 9"):
             users[row["name"]] = row["id"]
             users[row["username"]] = row["id"]
         for line_number, row in enumerate(reader, start=2):
@@ -772,7 +784,7 @@ def bootstrap():
         ).fetchall())
         user_fields = "id, name, role, username" if user["role"] == "admin" else "id, name, role"
         users = rows_to_dicts(connection.execute(
-            f"SELECT {user_fields} FROM users WHERE id BETWEEN 1 AND 7 ORDER BY id"
+            f"SELECT {user_fields} FROM users WHERE id BETWEEN 1 AND 9 ORDER BY id"
         ).fetchall())
         notifications = rows_to_dicts(connection.execute(
             "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50",
@@ -860,7 +872,7 @@ def check_notifications():
 def list_users():
     with db() as connection:
         users = rows_to_dicts(connection.execute(
-            "SELECT id, name, username, role FROM users WHERE id BETWEEN 1 AND 7 ORDER BY id"
+            "SELECT id, name, username, role FROM users WHERE id BETWEEN 1 AND 9 ORDER BY id"
         ).fetchall())
     return jsonify(users)
 
@@ -1040,7 +1052,7 @@ def update_milestone(milestone_id: int):
             (milestone_id,),
         ).fetchone())
         if achieved and not existing["achieved_at"]:
-            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 7"):
+            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 9"):
                 add_notification(
                     connection,
                     recipient["id"],
@@ -1123,7 +1135,7 @@ def create_task():
         )
         task_id = cursor.lastrowid
         if data.get("priority") == "high":
-            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 7"):
+            for recipient in connection.execute("SELECT id FROM users WHERE id BETWEEN 1 AND 9"):
                 add_notification(
                     connection,
                     recipient["id"],
@@ -1484,7 +1496,8 @@ def ai_weekly_report():
         gemini_report = gemini_generate(f"次の週次レポートに短い改善コメントを追加してください。\n{base}")
         report = gemini_report or base
         connection.execute("INSERT INTO ai_logs(prompt, response) VALUES (?, ?)", ("weekly-report", report))
-        add_notification(connection, current_user()["id"], "weekly", report, f"weekly:{date.today().isoformat()}")
+        for user_id in management_recipient_ids(connection, weekly_only=True):
+            add_notification(connection, user_id, "weekly", report, f"weekly:{date.today().isoformat()}")
     return jsonify(report=report, provider="gemini" if gemini_report else "local")
 
 
@@ -1499,7 +1512,8 @@ def scheduled_weekly_report() -> None:
         base = build_weekly_report(tasks)
         report = gemini_generate(f"次の週次レポートに短い改善コメントを追加してください。\n{base}") or base
         connection.execute("INSERT INTO ai_logs(prompt, response) VALUES (?, ?)", ("weekly-report", report))
-        add_notification(connection, 1, "weekly", report, f"weekly:{date.today().isoformat()}")
+        for user_id in management_recipient_ids(connection, weekly_only=True):
+            add_notification(connection, user_id, "weekly", report, f"weekly:{date.today().isoformat()}")
 
 
 @app.get("/api/health")

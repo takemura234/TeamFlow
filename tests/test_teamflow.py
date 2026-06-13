@@ -121,6 +121,37 @@ class TeamFlowApiTest(unittest.TestCase):
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.get_json()["user"]["role"], "member")
 
+    def test_viewer_accounts_can_comment_but_cannot_create_tasks(self):
+        for username in ("hirota", "yamazaki"):
+            viewer = server.app.test_client()
+            login = viewer.post(
+                "/api/session",
+                json={"username": username, "password": "TeamFlow2026!"},
+            )
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(login.get_json()["user"]["role"], "viewer")
+            csrf = {"X-CSRF-Token": login.get_json()["csrf_token"]}
+            denied = viewer.post(
+                "/api/tasks",
+                json={
+                    "title": "Viewer task", "project_id": 1,
+                    "start_date": "2026-06-13", "due_date": "2026-06-20",
+                },
+                headers=csrf,
+            )
+            self.assertEqual(denied.status_code, 403)
+            comment = viewer.post(
+                "/api/tasks/1/comments",
+                json={"body": f"{username} viewer comment"},
+                headers=csrf,
+            )
+            self.assertEqual(comment.status_code, 201)
+
+    def test_management_notifications_include_both_viewers(self):
+        with server.db() as connection:
+            recipients = server.management_recipient_ids(connection, weekly_only=True)
+        self.assertEqual(recipients, [1, 8, 9])
+
     def test_backup_can_be_created_and_downloaded(self):
         response = self.client.post("/api/admin/backup", headers=self.headers)
         self.assertEqual(response.status_code, 200)

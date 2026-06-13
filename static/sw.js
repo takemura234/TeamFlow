@@ -1,4 +1,4 @@
-const CACHE_NAME='teamflow-shell-v5';
+const CACHE_NAME='teamflow-shell-v6';
 const SHELL=[
   '/static/login.html',
   '/static/style.css',
