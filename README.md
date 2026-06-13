@@ -377,6 +377,8 @@ CSVの列は `title, project, assignee, start_date, due_date, priority, status, 
 
 スマホではHTTPSで公開したTeamFlowをブラウザで開き、「ホーム画面に追加」するとPWAとして起動できます。画面資産のみをキャッシュし、ログイン情報やAPIデータはキャッシュしません。
 
+ダッシュボード下部にスマホアクセス用QRコードを表示します。QRコードは現在開いているTeamFlowのログインURLから自動生成されます。
+
 ### 本番環境変数
 
 - `TEAMFLOW_SECRET_KEY`: セッション署名用の十分に長いランダム値

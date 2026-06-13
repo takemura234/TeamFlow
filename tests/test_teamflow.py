@@ -101,6 +101,18 @@ class TeamFlowApiTest(unittest.TestCase):
         self.assertEqual(manifest.get_json()["display"], "standalone")
         manifest.close()
 
+    def test_dashboard_access_qr_is_generated_as_svg(self):
+        response = self.client.get(
+            "/api/access-qr?url=https%3A%2F%2Fteamflow-lkt4.onrender.com%2Flogin"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "image/svg+xml")
+        self.assertIn(b"<svg", response.data)
+
+    def test_access_qr_rejects_invalid_url(self):
+        response = self.client.get("/api/access-qr?url=javascript%3Aalert(1)")
+        self.assertEqual(response.status_code, 400)
+
     def test_bootstrap_requires_login(self):
         anonymous = server.app.test_client()
         self.assertEqual(anonymous.get("/api/bootstrap").status_code, 401)

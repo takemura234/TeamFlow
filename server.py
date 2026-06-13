@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from functools import wraps
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,8 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, redirect, request, send_file, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
+import qrcode
+import qrcode.image.svg
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -484,6 +487,18 @@ def service_worker():
     response.headers["Service-Worker-Allowed"] = "/"
     response.headers["Cache-Control"] = "no-cache"
     return response
+
+
+@app.get("/api/access-qr")
+def access_qr():
+    target = request.args.get("url", "").strip()
+    parsed = urlparse(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or len(target) > 500:
+        return jsonify(error="QRコードのURLが正しくありません"), 400
+    image = qrcode.make(target, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
+    output = io.BytesIO()
+    image.save(output)
+    return Response(output.getvalue(), content_type="image/svg+xml", headers={"Cache-Control": "no-store"})
 
 
 @app.route("/api/session", methods=["GET", "POST", "DELETE"])
